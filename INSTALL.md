@@ -18,11 +18,10 @@ sudo apt install python3 python3-pip ffmpeg git
 ## Step 2 — Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/hik-monitor.git
+git clone https://github.com/manutdsnake/hik-monitor.git
 cd hik-monitor
 ```
 
-> Replace `YOUR_USERNAME` with the actual GitHub username.
 
 ---
 
@@ -67,7 +66,6 @@ hik-monitor/
             └── (several .so files)
 ```
 
-If anything is missing, re-clone the repository or check that Git LFS is installed (the `.so` files are stored with Git LFS):
 
 ```bash
 sudo apt install git-lfs
