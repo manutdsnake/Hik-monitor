@@ -1,7 +1,11 @@
 # Hik Monitor
 
-A desktop application for monitoring Hikvision NVR systems on Linux.  
+My personal project of desktop application for monitoring Hikvision NVR systems on Linux.  
 Supports live view, multi-camera grid layouts, recording playback, and timeline navigation.
+
+If something is broken I most likely won't fix it but you are free to. 
+It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x)
+
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
@@ -27,7 +31,7 @@ Supports live view, multi-camera grid layouts, recording playback, and timeline 
 
 ### System
 
-- Linux (Ubuntu 20.04 / 22.04 recommended), x86_64
+- Linux (Ubuntu 20.04 / 22.04 or newer recommended), x86_64
 - Python 3.8 or newer
 - ffmpeg (for playback)
 
@@ -44,7 +48,7 @@ pip install PyQt5 requests opencv-python numpy
 ### Hikvision SDK
 
 The application uses the Hikvision HCNetSDK and PlayCtrl SDK libraries.  
-These are included in the repository with written permission from Hikvision.
+These are included in the repository or you can get them from Hikvision.
 
 ---
 
@@ -114,10 +118,11 @@ Cameras will appear in the sidebar. Click or drag them into the grid to start st
 | NVR Model | Firmware | Status |
 |---|---|---|
 | DS-7604NI-K1/4P | V4.x | ✅ Working |
-
+| DS-7608NI-Q1 | V? | ✅ Working |
+Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x
 ---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).  
-Hikvision SDK libraries are included with written permission from Hikvision and remain subject to their own terms.
+Hikvision SDK libraries are owned by Hikvision and remain subject to their own terms.
