@@ -6,7 +6,14 @@ This guide walks you through installing and running Hik Monitor on Ubuntu/Debian
 
 ## Step 1 — Install system dependencies
 
-Open a terminal and run:
+
+Option A
+Open a terminal and run, everything should install automatically:
+```bash
+curl -fsSL https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/install.sh | bash
+```
+
+ELSE
 
 ```bash
 sudo apt update
