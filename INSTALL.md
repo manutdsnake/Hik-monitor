@@ -29,6 +29,8 @@ cd hik-monitor
 ## Step 3 — Install Python packages
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
