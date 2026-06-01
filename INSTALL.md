@@ -18,7 +18,7 @@ sudo apt install python3 python3-pip ffmpeg git python3.14-venv
 ## Step 2 — Clone the repository
 
 ```bash
-cd desktop
+cd Desktop
 git clone https://github.com/manutdsnake/hik-monitor.git
 cd hik-monitor
 ```
