@@ -1,41 +1,113 @@
+#!/usr/bin/env python3
+"""
+Hikvision Monitor — Python Desktop App
+DS-7604NI-K1/4P kompatibilan
+ISAPI za upravljanje + OpenCV za RTSP video
+"""
+
 import sys, os, json, threading, time, queue
 from datetime import datetime, timedelta
 from pathlib import Path
 
-                                                                                 
-                                                                            
-                                                                                
-                                                                           
-                                                                     
+# ── Bootstrap: set LD_LIBRARY_PATH and re-exec ONCE before loading any SDK .so ─
+# The Hikvision libs (libPlayCtrl.so deps, HCNetSDKCom) must be found by the
+# dynamic loader, which only reads LD_LIBRARY_PATH at process startup. We set it
+# and re-exec here — before importing hik_sdk/hik_play — so the SDK is only
+# initialized once (after the re-exec), not wastefully before it too.
 def _bootstrap_sdk_path():
-    sdk_path = os.environ.get('HIKVISION_SDK_PATH')\
+    sdk_path = os.environ.get('HIKVISION_SDK_PATH') \
                or os.path.expanduser('~/Desktop/sdk/lib')
     sdk_path = os.path.abspath(sdk_path)
     if not os.path.isdir(sdk_path):
-        return                                              
+        return   # no SDK installed — app will run RTSP-only
     com_path = os.path.join(sdk_path, 'HCNetSDKCom')
     parts = (os.environ.get('LD_LIBRARY_PATH', '') or '').split(':')
     if sdk_path in parts:
-        return                             
+        return   # already set — don't loop
     os.environ['LD_LIBRARY_PATH'] = ':'.join([sdk_path, com_path] + parts)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 _bootstrap_sdk_path()
 
-                                                                                
-                                                                        
+# ── Debug logging ─────────────────────────────────────────────────────────────
+# Set HIK_DEBUG=1 in the environment for verbose per-frame/stat logging.
+DEBUG = os.environ.get('HIK_DEBUG', '0') == '1'
+
+def dlog(category, msg):
+    if DEBUG:
+        print(f'[{time.strftime("%H:%M:%S")}] [{category}] {msg}', flush=True)
 
 def log(category, msg):
     print(f'[{time.strftime("%H:%M:%S")}] [{category}] {msg}', flush=True)
 
-                                                                                
+
+class StatsMonitor:
+    """Periodically logs CPU/RAM (and GPU if available). Runs only when HIK_DEBUG=1."""
+    def __init__(self, interval=3.0):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._have_psutil = False
+        try:
+            import psutil  # noqa
+            self._have_psutil = True
+        except ImportError:
+            pass
+
+    def start(self):
+        if DEBUG:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _gpu(self):
+        try:
+            import subprocess as sp
+            out = sp.run(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used',
+                          '--format=csv,noheader,nounits'],
+                         capture_output=True, text=True, timeout=2)
+            if out.returncode == 0:
+                return f'GPU {out.stdout.strip()}'
+        except Exception: pass
+        try:
+            import glob
+            for p in glob.glob('/sys/class/drm/card*/device/gpu_busy_percent'):
+                with open(p) as f:
+                    return f'GPU {f.read().strip()}%'
+        except Exception: pass
+        return ''
+
+    def _run(self):
+        proc = None
+        if self._have_psutil:
+            import psutil
+            proc = psutil.Process(); proc.cpu_percent(None)
+        else:
+            log('STATS', 'psutil not installed — CPU/RAM stats unavailable (pip install psutil)')
+        while not self._stop.wait(self.interval):
+            parts = []
+            if proc is not None:
+                parts += [f'CPU {proc.cpu_percent(None):.0f}%',
+                          f'RAM {proc.memory_info().rss/1024/1024:.0f}MB']
+            g = self._gpu()
+            if g: parts.append(g)
+            if parts: log('STATS', '  '.join(parts))
+
+_STATS = StatsMonitor()
+
+# ── GPU (VAAPI) hardware-decode detection ─────────────────────────────────────
 def _detect_vaapi():
-    """Return the DRI render node path if VAAPI HEVC/H264 decode is usable, else None."""
+    """Return a DRI render node that can ACTUALLY decode HEVC via VAAPI, else None.
+
+    Many machines expose a render node whose VAAPI driver can't decode HEVC (e.g.
+    Intel iGPUs without HEVC profiles, or NVIDIA which doesn't use VAAPI). We probe
+    each node with a tiny real decode so we don't pick a node that fails at runtime.
+    """
     import glob, subprocess as sp
     nodes = sorted(glob.glob('/dev/dri/renderD*'))
     if not nodes:
         return None
-                                                      
+    # ffmpeg must have vaapi support compiled in
     try:
         out = sp.run(['ffmpeg', '-hide_banner', '-hwaccels'],
                      capture_output=True, text=True, timeout=5)
@@ -43,13 +115,41 @@ def _detect_vaapi():
             return None
     except Exception:
         return None
-    return nodes[0]
+
+    # Generate a 1-frame HEVC test clip, then try to HW-decode+scale it on each
+    # node exactly the way playback does (scale_vaapi). Pick the first that works.
+    import tempfile, os as _os
+    test_clip = _os.path.join(tempfile.gettempdir(), 'hik_vaapi_probe.hevc')
+    try:
+        sp.run(['ffmpeg', '-y', '-loglevel', 'error', '-f', 'lavfi',
+                '-i', 'testsrc=size=320x240:rate=1:duration=1',
+                '-c:v', 'libx265', '-frames:v', '1', test_clip],
+               capture_output=True, timeout=15)
+    except Exception:
+        test_clip = None
+
+    for node in nodes:
+        if not test_clip or not _os.path.exists(test_clip):
+            break
+        try:
+            r = sp.run(['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                        '-hwaccel', 'vaapi', '-hwaccel_device', node,
+                        '-hwaccel_output_format', 'vaapi',
+                        '-i', test_clip,
+                        '-vf', 'scale_vaapi=w=160:h=120,hwdownload,format=nv12',
+                        '-f', 'null', '-'],
+                       capture_output=True, text=True, timeout=15)
+            if r.returncode == 0 and 'not supported' not in (r.stderr or ''):
+                return node
+        except Exception:
+            continue
+    return None
 
 _VAAPI_NODE = _detect_vaapi()
 if _VAAPI_NODE:
     print(f'[App] VAAPI GPU decode available at {_VAAPI_NODE} — playback will use GPU')
 else:
-    print('[App] VAAPI not available — playback will use PlayM4 (CPU) decode')
+    print('[App] VAAPI HEVC decode not available — playback will use CPU decode')
 try:
     from hik_sdk import HCNetSDK
     try:
@@ -60,7 +160,7 @@ try:
 except ImportError:
     print('[App] hik_sdk.py not found — playback will use RTSP/HTTP only')
 
-                                                                                 
+# PlayM4 native decoder (libPlayCtrl.so) — decodes without ffmpeg, like iVMS-4200
 try:
     from hik_play import PlayM4, yv12_to_rgb
     _PLAYM4_OK = True
@@ -86,7 +186,7 @@ from PyQt5.QtGui import (
     QImage, QPixmap, QFont, QColor, QPalette, QIcon
 )
 
-                                                                                 
+# ── Konfiguracija ──────────────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / '.hikvision_monitor.json'
 
 DARK = {
@@ -173,7 +273,7 @@ QSlider::handle:horizontal {{ background: {DARK['accent']}; border-radius: 7px; 
 QSlider::sub-page:horizontal {{ background: {DARK['accent']}; border-radius: 2px; }}
 """
 
-                                                                                 
+# ── NVR API ────────────────────────────────────────────────────────────────────
 class NVRClient:
     def __init__(self, device_id=None, name='NVR'):
         self.device_id = device_id or str(id(self))
@@ -183,9 +283,9 @@ class NVRClient:
         self.username  = 'admin'
         self.password  = ''
         self.timeout   = 10
-                                                                           
+        # SDK state — populated by sdk_login() after ISAPI connect succeeds
         self.sdk_user_id  = -1
-        self.start_dchan  = 33                                                    
+        self.start_dchan  = 33   # IP channel base, populated from SDK device info
 
     @classmethod
     def load_all(cls):
@@ -196,7 +296,7 @@ class NVRClient:
                 data = json.loads(CONFIG_FILE.read_text())
                 devices = data.get('devices', [])
                 if not devices and data.get('host'):
-                                                 
+                    # Legacy single-device format
                     devices = [data]
                 for d in devices:
                     c = cls(d.get('id'), d.get('name', 'NVR'))
@@ -226,7 +326,7 @@ class NVRClient:
         if _SDK is None:
             return False
         if self.sdk_user_id >= 0:
-            return True                      
+            return True   # already logged in
         try:
             self.sdk_user_id, info = _SDK.login(self.host, 8000, self.username, self.password)
             self.start_dchan = info.byStartDChan or 33
@@ -268,7 +368,7 @@ class NVRClient:
     def test(self):
         try:
             self.get('System/deviceInfo')
-                                                                       
+            # Best-effort SDK login (port 8000) — non-fatal if it fails
             self.sdk_login()
             return True, 'OK'
         except requests.exceptions.ConnectionError:
@@ -310,7 +410,7 @@ class NVRClient:
                 })
         except Exception as e:
             print(f'InputProxy error: {e} — pokušavam Streaming/channels')
-                                          
+            # Fallback: streaming channels
             try:
                 xml = self.get('Streaming/channels')
                 root = ET.fromstring(xml)
@@ -346,11 +446,11 @@ class NVRClient:
 
         def find_text(el, path, ns):
             """Traži nested XML path s namespace prefiksom na svakom dijelu"""
-                                                                      
+            # Primjer: 'timeSpan/startTime' → 'h:timeSpan/h:startTime'
             ns_path = '/'.join(f'h:{p}' for p in path.split('/'))
             found = el.find(ns_path, ns)
             if found is None:
-                found = el.find(path)                           
+                found = el.find(path)  # fallback bez namespacea
             return found.text.strip() if found is not None and found.text else ''
 
         def detect_ns(root):
@@ -359,14 +459,14 @@ class NVRClient:
                 return ns20
             if root.findall('.//h:matchList', ns10):
                 return ns10
-            return {}                  
+            return {}  # bez namespacea
 
         def parse_page(xml_resp):
             root = ET.fromstring(xml_resp)
             ns = detect_ns(root)
             items = (root.findall('.//h:matchList/h:searchMatchItem', ns) if ns
                      else root.findall('.//matchList/searchMatchItem'))
-                                                    
+            # Fix: ne koristimo 'or' na XML elementu
             status_el = root.find('h:responseStatusStrg', ns) if ns else None
             if status_el is None:
                 status_el = root.find('responseStatusStrg')
@@ -427,14 +527,14 @@ class NVRClient:
                 position += len(page_recs)
             return out
 
-                                                                             
-                                                                                   
-                                                                                 
-                                                                              
+        # Hikvision pagination via searchResultPosition is unreliable on many
+        # firmwares (returns the same first page → recordings only up to ~mid-day).
+        # Robust fix: split the 24h day into smaller time windows and search each
+        # separately, then merge + dedup. Each window easily fits in one page.
         recs = []
         seen_keys = set()
         WINDOW_HOURS = 2
-        day_str = date.strftime('%Y-%m-%d')                                     
+        day_str = date.strftime('%Y-%m-%d')   # works for both date and datetime
         h = 0
         while h < 24:
             we_h = min(h + WINDOW_HOURS, 24)
@@ -456,14 +556,14 @@ class NVRClient:
                 seen_keys.add(k)
                 recs.append(r)
                 added += 1
-            print(f'[ISAPI] Prozor {win_start[11:16]}–{win_end[11:16]}: '
+            dlog('ISAPI', f'Prozor {win_start[11:16]}–{win_end[11:16]}: '
                   f'{len(win_recs)} nađeno, {added} novih, ukupno={len(recs)}')
             h += WINDOW_HOURS
 
         try:
             recs.sort(key=lambda r: r.get('start', ''))
         except: pass
-        print(f'[ISAPI] UKUPNO za dan: {len(recs)} snimaka')
+        dlog('ISAPI', f'UKUPNO za dan: {len(recs)} snimaka')
         return recs
 
     def rtsp_live_url(self, channel_id, sub=False):
@@ -477,7 +577,7 @@ class NVRClient:
         """
         import subprocess as sp
         ch = str(channel_id)
-                                       
+        # Tipični Hikvision URL formati
         candidates = [
             f'rtsp://{self.host}:554/Streaming/Channels/{ch}01',
             f'rtsp://{self.host}:554/Streaming/Channels/{ch}02',
@@ -522,7 +622,7 @@ class NVRClient:
                 f'{self.host}:{self.port}'
                 f'/ISAPI/ContentMgmt/download?playbackURI={encoded}')
 
-                                                                                 
+# ── Video Worker Thread ────────────────────────────────────────────────────────
 def _sniff_codec(data: bytes):
     """
     Detect H.264 vs H.265 from a raw elementary stream by inspecting NAL headers.
@@ -544,6 +644,7 @@ def _sniff_codec(data: bytes):
         else:
             i += 1
     return None
+
 
 class VideoWorker(QThread):
     """
@@ -580,17 +681,17 @@ class VideoWorker(QThread):
         self._sdk_handle = -1
         self._sdk_mode   = 'playback'
         self._feed_thread = None
-        self._player    = None                                             
-        self._tmp_file  = None                                        
-        self._dl_handle = -1                                                 
-        self._dl_complete = False                                            
-        self._dl_percent = 0                                         
+        self._player    = None       # PlayM4 instance (native decode path)
+        self._tmp_file  = None       # temp download file for playback
+        self._dl_handle = -1         # SDK download handle (must be stopped!)
+        self._dl_complete = False    # True once full recording is downloaded
+        self._dl_percent = 0         # live download progress (0-100)
         self._file_base_offset_s = 0.0
         self.fps        = 25.0
-                                                                                
+        # Backpressure flag — True while a frame is queued but not yet displayed
         self._frame_in_flight = False
 
-                                                                                 
+    # ── Public control ─────────────────────────────────────────────────────────
     def pause(self):
         self._pause.set()
         if self._player:
@@ -611,7 +712,7 @@ class VideoWorker(QThread):
     def stop(self):
         self._stop.set()
         self._pause.clear()
-                                                                               
+        # Stop SDK download if one is in progress (its threads spin otherwise!)
         if self._dl_handle >= 0 and _SDK:
             try: _SDK.download_stop(self._dl_handle)
             except: pass
@@ -634,18 +735,18 @@ class VideoWorker(QThread):
             except: pass
             try: self._proc.terminate()
             except: pass
-                                          
+        # Delete temp download file if any
         if self._tmp_file:
             try: os.unlink(self._tmp_file)
             except: pass
             self._tmp_file = None
 
-                                                                                  
+    # ── ffmpeg builders ─────────────────────────────────────────────────────────
     def _ffmpeg_base(self, extra_in, source):
         """Common ffmpeg command. extra_in: list of input opts. source: -i value."""
         W, H = self.decode_w, self.decode_h
         vf = f'scale={W}:{H}'
-                                                                   
+        # Speed control for playback via setpts (only when not 1.0)
         if self.speed and self.speed != 1.0:
             vf += f',setpts=PTS/{self.speed}'
         return ['ffmpeg', '-loglevel', 'error', *extra_in,
@@ -698,8 +799,8 @@ class VideoWorker(QThread):
         mode    = src.get('mode', 'playback')
         self._sdk_mode = mode
 
-                                                                            
-                                                                    
+        # For playback, '-re' paces ffmpeg to real-time → SDK feed naturally
+        # throttled by pipe backpressure (prevents flooding the UI).
         extra_in = ['-analyzeduration', '2000000', '-probesize', '2000000']
         if mode == 'playback':
             extra_in = ['-re', *extra_in]
@@ -728,7 +829,7 @@ class VideoWorker(QThread):
             raise RuntimeError(f'SDK start failed: {e}')
         return proc
 
-                                                                                   
+    # ── PlayM4 native decode path (no ffmpeg) ────────────────────────────────────
     def _run_download_play(self):
         """
         Download the recording segment to a temp file via the SDK, then play the
@@ -743,9 +844,9 @@ class VideoWorker(QThread):
         W, H = self.decode_w, self.decode_h
         frame_bytes = W * H * 3
 
-                                                                                 
-                                                                              
-                                                                                  
+        # Wait for the previous playback worker to fully release its SDK download
+        # session before we start ours. Rapid switching otherwise overlaps two
+        # downloads on the same channel and the NVR returns an empty/invalid file.
         wait_for = src.get('wait_for')
         if wait_for is not None:
             wait_for.wait(timeout=3.0)
@@ -757,22 +858,22 @@ class VideoWorker(QThread):
         tmp.close()
         self._tmp_file = tmp_path
 
-                                                                                
-                                                                                 
-                                                                                  
-                                                                   
+        # ── 1. Start download in BACKGROUND; play the file as it grows ────────
+        # We don't wait for 100%. The SDK writes to tmp_path continuously; ffmpeg
+        # reads the growing file. We only wait for a small prebuffer so ffmpeg has
+        # a valid header + a few seconds of data to start decoding.
         try:
             dh = _SDK.download_start(nvr.sdk_user_id, real_ch,
                                      src['start_dt'], src['end_dt'], tmp_path)
             self._dl_handle = dh
-            log('DOWNLOAD', f'started (stream-as-grows) ch={real_ch} '
+            dlog('DOWNLOAD', f'started (stream-as-grows) ch={real_ch} '
                             f'start={src["start_dt"]:%H:%M:%S} end={src["end_dt"]:%H:%M:%S} '
                             f'→ {tmp_path}')
         except Exception as e:
             self.error.emit(self.channel_id, f'Download failed: {e}')
             return
 
-                                                                                  
+        # Background thread keeps the download alive + reports progress + stops it
         dl_done = {'flag': False}
         self._dl_percent = 0
         def _dl_monitor():
@@ -791,14 +892,18 @@ class VideoWorker(QThread):
             try: _SDK.download_stop(dh)
             except: pass
             self._dl_handle = -1
-            self._dl_complete = True                                               
-
+            self._dl_complete = True   # full recording now on disk → local seek OK
+            try:
+                if os.path.exists(tmp_path):
+                    dlog('DOWNLOAD', f'finished ({os.path.getsize(tmp_path)/1024:.0f} KB)')
+            except Exception:
+                pass
         self._dl_complete = False
         self._dl_percent = 0
         threading.Thread(target=_dl_monitor, daemon=True).start()
 
-                                                                               
-        self.position_ms.emit(-1)                                          
+        # Wait for a small prebuffer (≈2 MB) so ffmpeg can read a valid header.
+        self.position_ms.emit(-1)   # show "Buffering…" via negative signal
         prebuf_t0 = time.time()
         while not self._stop.is_set():
             sz = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
@@ -810,22 +915,25 @@ class VideoWorker(QThread):
             time.sleep(0.1)
         if self._stop.is_set():
             return
+        dlog('PLAYFILE', f'prebuffer ready ({os.path.getsize(tmp_path)/1024:.0f} KB), starting playback')
 
-                                                                                
+        # ── 2. Play the (growing) file with GPU decode + real-time pacing ─────
         nv12_bytes = W * H * 3 // 2
         self._play_file_loop(tmp_path, W, H, nv12_bytes,
                              seek_off=src.get('seek_offset_s', 0.0))
 
-    def _build_play_cmd(self, tmp_path, W, H, seek_off=0.0):
-        """ffmpeg command for playing a local recording file with GPU decode."""
-        use_gpu = bool(_VAAPI_NODE)
+    def _build_play_cmd(self, tmp_path, W, H, seek_off=0.0, force_sw=False):
+        """ffmpeg command for playing a local recording file. Uses GPU (VAAPI)
+        decode when available; force_sw=True forces pure software decode (used as
+        a fallback when GPU decode produces no frames on this machine)."""
+        use_gpu = bool(_VAAPI_NODE) and not force_sw
         if use_gpu:
             vf = f'scale_vaapi=w={W}:h={H},hwdownload,format=nv12'
         else:
             vf = f'scale={W}:{H}'
         spd = self.speed if (self.speed and self.speed > 0) else 1.0
         cmd = ['ffmpeg', '-loglevel', 'error', '-readrate', f'{spd:.3f}']
-                                                                                  
+        # -ss BEFORE -i = fast input seek (keyframe-accurate, very fast on a file)
         if seek_off and seek_off > 0:
             cmd += ['-ss', f'{seek_off:.3f}']
         if use_gpu:
@@ -842,7 +950,7 @@ class VideoWorker(QThread):
             return
         self._local_seek_to = offset_s
         self._local_seek_req.set()
-                                                                                 
+        # Stop the current ffmpeg; the play loop will relaunch at the new offset.
         if self._proc:
             try: self._proc.terminate()
             except: pass
@@ -851,29 +959,23 @@ class VideoWorker(QThread):
         import subprocess as sp, numpy as np, cv2
         self._local_seek_req = threading.Event()
         self._local_seek_to = 0.0
+        force_sw = False   # set True if GPU decode produced no frames → retry on CPU
 
         while not self._stop.is_set():
-            cmd, use_gpu = self._build_play_cmd(tmp_path, W, H, seek_off)
+            cmd, use_gpu = self._build_play_cmd(tmp_path, W, H, seek_off,
+                                                force_sw=force_sw)
             try:
                 self._proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE,
                                       bufsize=nv12_bytes)
             except Exception as e:
                 self.error.emit(self.channel_id, f'Playback failed: {e}')
                 return
-            log('PLAYFILE', f'playing {tmp_path} (GPU={"yes" if use_gpu else "no"}, '
+            dlog('PLAYFILE', f'playing {tmp_path} (GPU={"yes" if use_gpu else "no"}, '
                             f'NV12+cv2, speed={self.speed}×, -ss={seek_off:.0f}s)')
 
             stdout = self._proc.stdout
             base_frames = int(seek_off * self.fps)
             frame_counter = 0
-            clk = os.sysconf('SC_CLK_TCK')
-            def _ffmpeg_cpu():
-                try:
-                    with open(f'/proc/{self._proc.pid}/stat') as f:
-                        p = f.read().split()
-                    return (int(p[13]) + int(p[14])) / clk
-                except: return 0.0
-            cpu0 = _ffmpeg_cpu(); t_stat = time.time()
 
             relaunch = False
             while not self._stop.is_set():
@@ -889,17 +991,36 @@ class VideoWorker(QThread):
                 raw = stdout.read(nv12_bytes)
                 if len(raw) != nv12_bytes:
                     if self._proc.poll() is not None:
-                                                                              
-                                                                            
                         if self._local_seek_req.is_set():
                             self._local_seek_req.clear()
                             seek_off = self._local_seek_to
                             relaunch = True
                             break
                         err = b''
-                        try: err = self._proc.stderr.read(1500)
+                        try: err = self._proc.stderr.read(2500)
                         except: pass
                         m = err.decode(errors='replace').strip()
+
+                        # ffmpeg exited having produced NO frames → decode failed
+                        # (commonly GPU/VAAPI not usable on this machine). Retry
+                        # once with pure software decode before giving up.
+                        if frame_counter == 0 and use_gpu and not force_sw:
+                            if m:
+                                log('PLAYFILE', f'GPU decode failed, retrying on CPU. ffmpeg: {m[:300]}')
+                            else:
+                                log('PLAYFILE', 'GPU decode produced no frames, retrying on CPU')
+                            force_sw = True
+                            relaunch = True
+                            break
+
+                        if frame_counter == 0:
+                            # Even software decode produced nothing → real error,
+                            # report it (don't silently auto-advance forever).
+                            log('PLAYFILE', f'playback produced no frames. ffmpeg: {m[:300]}')
+                            self.error.emit(self.channel_id, 'Playback error')
+                            return
+
+                        if m: dlog('PLAYFILE', f'ffmpeg: {m}')
                         self.error.emit(self.channel_id, 'Playback finished')
                         return
                     time.sleep(0.02); continue
@@ -914,7 +1035,7 @@ class VideoWorker(QThread):
                     abs_frame = base_frames + frame_counter
                     self.position_ms.emit(int(abs_frame / self.fps * 1000))
 
-                                                          
+            # tear down this ffmpeg before relaunch / exit
             if self._proc:
                 try: self._proc.terminate(); self._proc.wait(timeout=2)
                 except: pass
@@ -939,8 +1060,8 @@ class VideoWorker(QThread):
         W, H = self.decode_w, self.decode_h
         frame_bytes = W * H * 3
 
-                                                                            
-                                                                      
+        # Buffer the first stream bytes to sniff the codec (H.264 vs H.265),
+        # then launch ffmpeg with the correct -f and VAAPI HW decoder.
         first = {'buf': bytearray(), 'ready': threading.Event(), 'codec': None}
 
         def sniff(data):
@@ -949,7 +1070,7 @@ class VideoWorker(QThread):
                 first['codec'] = _sniff_codec(bytes(first['buf']))
                 first['ready'].set()
 
-                                                                                 
+        # Start SDK stream into a queue first; we hold data until ffmpeg launches
         import queue as _q
         dq = _q.Queue(maxsize=2000)
 
@@ -973,11 +1094,11 @@ class VideoWorker(QThread):
             self.error.emit(self.channel_id, f'SDK stream failed: {e}')
             return
 
-                                           
+        # Wait for codec detection (max 3s)
         if not first['ready'].wait(3.0):
-            first['codec'] = 'hevc'                 
+            first['codec'] = 'hevc'  # default guess
         codec = first['codec'] or 'hevc'
-        log('VAAPI', f'{self.channel_id} codec={codec} ch={real_ch} mode={mode}')
+        dlog('VAAPI', f'{self.channel_id} codec={codec} ch={real_ch} mode={mode}')
 
         vf = f'scale_vaapi=w={W}:h={H},hwdownload,format=nv12'
         if mode == 'playback' and self.speed and self.speed != 1.0:
@@ -999,7 +1120,7 @@ class VideoWorker(QThread):
             self.error.emit(self.channel_id, f'GPU decoder failed: {e}')
             return
 
-                                                                                  
+        # Feeder thread: drains the queue (incl. buffered first bytes) into ffmpeg
         def feeder():
             try:
                 self._proc.stdin.write(bytes(first['buf']))
@@ -1034,6 +1155,7 @@ class VideoWorker(QThread):
                     try: err = self._proc.stderr.read(1500)
                     except: pass
                     m = err.decode(errors='replace').strip()
+                    if m: dlog('VAAPI', f'{self.channel_id} ffmpeg: {m}')
                     self.error.emit(self.channel_id,
                         'Playback finished' if mode == 'playback' else 'Stream ended')
                     break
@@ -1047,6 +1169,9 @@ class VideoWorker(QThread):
             frame_counter += 1
             if mode == 'playback' and frame_counter % 15 == 0:
                 self.position_ms.emit(int(frame_counter / self.fps * 1000))
+            if DEBUG and time.time() - last >= 2.0:
+                dlog('VAAPI', f'{self.channel_id}: {frame_counter} frames')
+                last = time.time()
 
         if self._proc:
             try: self._proc.terminate(); self._proc.wait(timeout=2)
@@ -1064,7 +1189,7 @@ class VideoWorker(QThread):
         mode    = src.get('mode', 'playback')
         self._sdk_mode = mode
 
-               
+        # Stats
         st = {'decoded': 0, 'emitted': 0, 'dropped': 0, 'fed': 0,
               'bytes': 0, 'last': time.time(), 'conv_ms': 0.0}
         target_w, target_h = self.decode_w, self.decode_h
@@ -1090,12 +1215,25 @@ class VideoWorker(QThread):
                 self._frame_in_flight = True
                 st['emitted'] += 1
                 self.frame_ready.emit(self.channel_id, qi)
+                if st['emitted'] == 1:
+                    dlog('DECODE', f'{self.channel_id}: first frame {w}x{h} → {rw}x{rh}')
             except Exception as e:
                 log('DECODE', f'{self.channel_id} convert error: {e}')
+
+            # FPS report every ~2s in debug
+            now = time.time()
+            if DEBUG and now - st['last'] >= 2.0:
+                dt = now - st['last']
+                avg_conv = st['conv_ms'] / max(1, st['emitted'])
+                dlog('FPS', f'{self.channel_id}: dec={st["decoded"]/dt:.0f}/s '
+                            f'emit={st["emitted"]/dt:.0f}/s drop={st["dropped"]/dt:.0f}/s '
+                            f'conv={avg_conv:.1f}ms feed={st["bytes"]/1024/dt:.0f}KB/s')
+                st.update(decoded=0, emitted=0, dropped=0, bytes=0, conv_ms=0.0, last=now)
 
         try:
             self._player = PlayM4()
             self._player.open(on_decoded, realtime=(mode == 'live'))
+            dlog('PLAYM4', f'{self.channel_id}: decoder port opened (mode={mode})')
         except Exception as e:
             log('PLAYM4', f'{self.channel_id}: decoder init FAILED: {e}')
             self.error.emit(self.channel_id, f'Decoder init failed: {e}')
@@ -1107,22 +1245,22 @@ class VideoWorker(QThread):
             st['fed'] += 1
             st['bytes'] += len(data)
             try:
-                                                                              
+                # dtype: 1 = NET_DVR_SYSHEAD (stream header), 2 = stream data.
                 self._player.input(data, is_header=(dtype == 1))
-            except Exception:
-                pass
+            except Exception as e:
+                dlog('FEED', f'{self.channel_id} input error: {e}')
 
-                                                                                
-                                                                                
-                                                                           
-                                                                          
-                                                                               
-                                                                          
-                                                            
+            # ── Flow control (playback only) ──────────────────────────────────
+            # The NVR dumps recordings far faster than real-time (~6MB/s). If we
+            # let PlayM4 decode all of it, CPU spikes and 90% of frames are
+            # dropped. Throttle the SDK feed: if PlayM4 still has a lot of
+            # undecoded data buffered, sleep here (this runs on the SDK thread,
+            # so sleeping naturally slows the NVR's delivery). PlayM4 then
+            # decodes at ~real-time and we stop wasting CPU.
             if mode == 'playback' and not self._stop.is_set():
                 while not self._stop.is_set() and not self._pause.is_set():
                     remain = self._player.source_buffer_remain()
-                                                                                    
+                    # Keep ~1.5 MB buffered (≈0.5-1s of HD video). Above that, wait.
                     if remain < 1_500_000:
                         break
                     time.sleep(0.02)
@@ -1131,18 +1269,18 @@ class VideoWorker(QThread):
             if mode == 'live':
                 self._sdk_handle = _SDK.realplay(nvr.sdk_user_id, real_ch, sdk_data,
                                                  sub=src.get('sub', False))
-                log('PLAYM4', f'Live {self.channel_id} ch={real_ch} '
+                dlog('PLAYM4', f'Live {self.channel_id} ch={real_ch} '
                               f'sub={src.get("sub", False)} handle={self._sdk_handle}')
             else:
                 self._sdk_handle = _SDK.playback_by_time(
                     nvr.sdk_user_id, real_ch, src['start_dt'], src['end_dt'], sdk_data)
-                log('PLAYM4', f'Playback {self.channel_id} ch={real_ch} '
+                dlog('PLAYM4', f'Playback {self.channel_id} ch={real_ch} '
                               f'handle={self._sdk_handle}')
         except Exception as e:
             self.error.emit(self.channel_id, f'SDK stream failed: {e}')
             return
 
-                                                              
+        # Watchdog: warn if no data/frames after a few seconds
         check_at = time.time() + 5.0
         warned = False
         while not self._stop.is_set():
@@ -1151,8 +1289,8 @@ class VideoWorker(QThread):
                 warned = True
                 if st['fed'] == 0:
                     log('PLAYM4', f'{self.channel_id}: WARNING no stream data from SDK after 5s')
-                                                                                   
-                                                      
+                    # Sub-stream may not be configured on this camera. Ask the cell
+                    # to fall back to the main stream.
                     if src.get('sub'):
                         self.error.emit(self.channel_id, 'NO_SUBSTREAM')
                         return
@@ -1160,16 +1298,17 @@ class VideoWorker(QThread):
                     log('PLAYM4', f'{self.channel_id}: WARNING data flowing ({st["fed"]} pkts) '
                                   f'but PlayM4 decoded 0 frames — check codec/SetStreamOpenMode')
                 else:
-                    pass
+                    dlog('PLAYM4', f'{self.channel_id}: healthy — '
+                                   f'fed={st["fed"]} decoded={st["decoded"]} emitted={st["emitted"]}')
 
-                                                                                   
+    # ── Main loop ────────────────────────────────────────────────────────────────
     def run(self):
         import numpy as np
 
-                             
-                                                                                 
-                                                                              
-                                                                         
+        # SDK source routing:
+        #   playback → download to file then play (GPU, low CPU, real-time paced)
+        #   live     → PlayM4 native decode (proven good; VAAPI streaming gave
+        #              a green/garbled image due to NV12 layout mismatch)
         if self.sdk_source is not None and _SDK:
             mode = self.sdk_source.get('mode', 'playback')
             if mode == 'playback':
@@ -1208,7 +1347,7 @@ class VideoWorker(QThread):
                 time.sleep(0.05)
                 continue
 
-                                                                                  
+            # Read exactly one full frame (read() loops internally until n or EOF)
             raw = stdout.read(frame_bytes)
 
             if len(raw) != frame_bytes:
@@ -1234,7 +1373,7 @@ class VideoWorker(QThread):
             empty_count    = 0
             frame_counter += 1
 
-                                                                                  
+            # ── Backpressure: drop frame if UI is still busy with the last one ──
             if self._frame_in_flight:
                 continue
 
@@ -1252,7 +1391,7 @@ class VideoWorker(QThread):
             try: self._proc.wait(timeout=2)
             except: pass
 
-                                                                                
+# ── Fullscreen prozor ─────────────────────────────────────────────────────────
 class FullscreenWindow(QWidget):
     def __init__(self, channel_id, name, nvr, parent=None):
         super().__init__(parent)
@@ -1292,14 +1431,15 @@ class FullscreenWindow(QWidget):
         self.worker.wait(2000)
         super().closeEvent(e)
 
-                                                                                 
+
+# ── Video Cell Widget ──────────────────────────────────────────────────────────
 class VideoCell(QFrame):
     clicked = pyqtSignal(str)
 
     def __init__(self, channel_id, name, nvr: NVRClient, parent=None, real_channel=None):
         super().__init__(parent)
         self.channel_id   = channel_id
-        self.real_channel = real_channel or channel_id                               
+        self.real_channel = real_channel or channel_id  # actual NVR channel for RTSP
         self.name = name
         self.nvr = nvr
         self.worker = None
@@ -1314,7 +1454,7 @@ class VideoCell(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-                     
+        # Video label
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet('border: none; background: transparent;')
@@ -1322,14 +1462,14 @@ class VideoCell(QFrame):
         self.video_label.setScaledContents(False)
         lay.addWidget(self.video_label)
 
-                     
+        # Placeholder
         self.placeholder = QLabel(f'📷\n{name}')
         self.placeholder.setAlignment(Qt.AlignCenter)
         self.placeholder.setStyleSheet(f'color: {DARK["dim"]}; font-size: 13px; border: none;')
         lay.addWidget(self.placeholder)
         self.video_label.hide()
 
-                    
+        # Bottom bar
         bar = QWidget()
         bar.setFixedHeight(30)
         bar.setStyleSheet(f'background: rgba(0,0,0,0.7); border: none;')
@@ -1365,16 +1505,17 @@ class VideoCell(QFrame):
         self._fs_win.show()
 
     def start_stream(self, sub=False):
-                                                                  
+        # Zombie detection: flag says streaming but worker is gone
         if self._streaming:
             if not self.worker or not self.worker.isRunning():
-                print(f'[Cell {self.name}] Zombie streaming flag — clearing')
+                dlog('Cell', f'{self.name} zombie streaming flag — clearing')
                 self._streaming = False
             else:
+                dlog('CELL', f'{self.name}: already streaming, skip start')
                 return
 
-                                                                                
-                                              
+        # Clear any stale frame from a previous camera so we don't show its last
+        # image while the new stream spins up.
         self.video_label.setPixmap(QPixmap())
         self.video_label.hide()
         self.placeholder.show()
@@ -1383,15 +1524,15 @@ class VideoCell(QFrame):
         self.status_dot.setStyleSheet(f'color: {DARK["amber"]}; font-size: 10px; border: none;')
         self.placeholder.setText(f'⏳\nConnecting...')
 
-                                                                                  
+        # Decode resolution: sub-stream (multi-view) small, main-stream (1×1) full
         if sub:
             dw, dh = 640, 360
         else:
             dw, dh = 1280, 720
 
-                                                                                 
+        # Prefer SDK + PlayM4 native decode (no ffmpeg, no RTSP bandwidth limit).
         if _PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0:
-            print(f'[SDK Live {"sub" if sub else "main"}] {self.name}  '
+            dlog('Live', f'SDK {"sub" if sub else "main"} {self.name}  '
                   f'ch={self.real_channel}  decode={dw}x{dh}')
             self.worker = VideoWorker(
                 self.channel_id, '', decode_w=dw, decode_h=dh,
@@ -1399,7 +1540,7 @@ class VideoCell(QFrame):
                             'mode': 'live', 'sub': sub})
         else:
             url = self.nvr.rtsp_live_url(self.real_channel, sub)
-            print(f'[RTSP {"sub" if sub else "main"}] {self.name} → '
+            dlog('Live', f'RTSP {"sub" if sub else "main"} {self.name} → '
                   f'{url.replace(self.nvr.password, "***")}  decode={dw}x{dh}')
             self.worker = VideoWorker(self.channel_id, url, decode_w=dw, decode_h=dh)
 
@@ -1409,16 +1550,16 @@ class VideoCell(QFrame):
 
     def stop_stream(self):
         if self.worker:
-            print(f'[Cell {self.name}] STOP')
+            dlog('Cell', f'{self.name} STOP')
             old = self.worker
             self.worker = None
-                                                                                 
-                                                               
+            # Disconnect signals FIRST so late frames from the dying worker don't
+            # hit _on_frame and interfere with the next stream.
             try: old.frame_ready.disconnect(self._on_frame)
             except: pass
             try: old.error.disconnect(self._on_error)
             except: pass
-                                                      
+            # Background cleanup — UI stays responsive
             threading.Thread(
                 target=lambda w=old: (w.stop(), w.wait(3000)),
                 daemon=True
@@ -1448,8 +1589,8 @@ class VideoCell(QFrame):
 
     def _on_error(self, cid, msg):
         if msg == 'NO_SUBSTREAM':
-                                                                               
-            print(f'[Cell {self.name}] no sub-stream, falling back to main')
+            # Sub-stream not available on this camera → retry with main stream.
+            dlog('Cell', f'{self.name} no sub-stream, falling back to main')
             self._streaming = False
             QTimer.singleShot(100, lambda: self.start_stream(sub=False))
             return
@@ -1459,7 +1600,7 @@ class VideoCell(QFrame):
         self.placeholder.show()
         self.status_dot.setStyleSheet(f'color: {DARK["red"]}; font-size: 10px; border: none;')
 
-                                                                                 
+# ── Live View Tab ──────────────────────────────────────────────────────────────
 class LiveViewTab(QWidget):
     def __init__(self, nvr: NVRClient, parent=None):
         super().__init__(parent)
@@ -1471,7 +1612,7 @@ class LiveViewTab(QWidget):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
 
-                 
+        # Toolbar
         toolbar = QHBoxLayout()
         self.btn_all = QPushButton('▶  Start all')
         self.btn_all.setProperty('class', 'success')
@@ -1481,7 +1622,7 @@ class LiveViewTab(QWidget):
         self.btn_stop.setProperty('class', 'danger')
         self.btn_stop.clicked.connect(self.stop_all)
 
-                                                                        
+        # Quality auto-select label (replaces the old sub-stream toggle)
         self.lbl_quality = QLabel('Quality: auto')
         self.lbl_quality.setStyleSheet(f'color:{DARK["dim"]};font-size:11px;padding:0 8px;')
 
@@ -1498,7 +1639,7 @@ class LiveViewTab(QWidget):
         toolbar.addWidget(self.grid_combo)
         lay.addLayout(toolbar)
 
-                   
+        # Grid area
         self.grid_widget = QWidget()
         self.grid_widget.setAcceptDrops(True)
         self.grid_widget.dragEnterEvent = self._grid_drag_enter
@@ -1515,8 +1656,8 @@ class LiveViewTab(QWidget):
         self.selected_cam_id = cameras[0]['id'] if cameras else None
         for cam in cameras[:16]:
             nvr = cam.get('_nvr', self.nvr)
-            uid = cam['id']                                                    
-                                                                       
+            uid = cam['id']  # already uid after _refresh_camera_list transform
+            # Extract real channel id for RTSP (strip deviceid_ prefix)
             real_ch = uid.split('_', 1)[-1] if '_' in uid else uid
             cell = VideoCell(uid, cam['name'], nvr, real_channel=real_ch)
             cell.clicked.connect(self.select_camera)
@@ -1534,15 +1675,15 @@ class LiveViewTab(QWidget):
             self.relayout(0)
             new_cell = self.cells.get(channel_id)
             if new_cell:
-                                                     
+                # Clear stale flag if the worker died
                 if new_cell._streaming and (not new_cell.worker or
                                             not new_cell.worker.isRunning()):
                     new_cell._streaming = False
                 if not new_cell._streaming:
                     new_cell.start_stream(self._should_use_sub())
 
-                                                                             
-                                                                       
+            # Stop the previously shown camera shortly after, so its teardown
+            # overlaps the new stream's startup instead of blocking it.
             if old_id and old_id != channel_id:
                 old_cell = self.cells.get(old_id)
                 if old_cell and old_cell._streaming:
@@ -1564,12 +1705,12 @@ class LiveViewTab(QWidget):
         """Restart active streams when grid changes to apply new quality."""
         self._update_quality_label()
         self.relayout(idx)
-                                                             
+        # Restart any active streams with appropriate quality
         sub = self._should_use_sub()
         for cell in self.cells.values():
             if cell._streaming:
                 cell.stop_stream()
-                                                                              
+                # Tiny delay between stop/start to let NVR release the session
                 QTimer.singleShot(300, lambda c=cell, s=sub: c.start_stream(s))
 
     def relayout(self, idx=None):
@@ -1583,9 +1724,9 @@ class LiveViewTab(QWidget):
         sel = self.cells.get(getattr(self, 'selected_cam_id', None)) or cams[0]
         mode = self.grid_combo.currentIndex()
 
-                                                                          
-                                                                                 
-                                                                                  
+        # Determine which cells are visible in this layout, hide the rest.
+        # takeAt() only removes the layout item — the widget stays visible at its
+        # old position unless we explicitly hide it (the "ghost grid in 1×1" bug).
         if mode == 0:
             visible = [sel]
         elif mode == 1:
@@ -1604,28 +1745,28 @@ class LiveViewTab(QWidget):
             else:
                 c.hide()
 
-        if mode == 0:         
+        if mode == 0:    # 1×1
             self.grid_layout.addWidget(sel, 0, 0)
-        elif mode == 1:       
+        elif mode == 1:  # 2×2
             for i, c in enumerate(cams[:4]):
                 self.grid_layout.addWidget(c, i//2, i%2)
-        elif mode == 2:       
+        elif mode == 2:  # 3×3
             for i, c in enumerate(cams[:9]):
                 self.grid_layout.addWidget(c, i//3, i%3)
-        elif mode == 3:       
+        elif mode == 3:  # 4×4
             for i, c in enumerate(cams[:16]):
                 self.grid_layout.addWidget(c, i//4, i%4)
-        elif mode == 4:       
+        elif mode == 4:  # 1+3
             self.grid_layout.addWidget(sel, 0, 0, 2, 2)
             others = [c for c in cams if c is not sel]
             for i, c in enumerate(others[:3]):
                 self.grid_layout.addWidget(c, i, 2)
-        elif mode == 5:       
+        elif mode == 5:  # 1+7
             self.grid_layout.addWidget(sel, 0, 0, 2, 2)
             others = [c for c in cams if c is not sel]
             for i, c in enumerate(others[:7]):
                 row, col = divmod(i, 2)
-                                                    
+                # Right column (2 rows) + bottom row
                 if i < 2:
                     self.grid_layout.addWidget(c, i, 2)
                 else:
@@ -1641,13 +1782,13 @@ class LiveViewTab(QWidget):
             return
         cell = self.cells[uid]
         if self.grid_combo.currentIndex() == 0:
-                                                                
+            # Already in 1×1 → make this the single shown camera
             self.select_camera(uid)
             if not cell._streaming:
                 cell.start_stream(self._should_use_sub())
         else:
-                                                                               
-                                     
+            # Multi-view (2×2, 3×3, …): just start this camera in its own cell;
+            # do NOT collapse to 1×1.
             if not cell._streaming:
                 cell.start_stream(self._should_use_sub())
 
@@ -1660,7 +1801,8 @@ class LiveViewTab(QWidget):
         for cell in self.cells.values():
             cell.stop_stream()
 
-                                                                                 
+
+# ── Timeline Widget ────────────────────────────────────────────────────────────
 class TimelineWidget(QWidget):
     """
     iVMS-style timeline:
@@ -1670,8 +1812,8 @@ class TimelineWidget(QWidget):
     - Click: seek to time at that position
     - Playback updates cursor (timeline pans to follow)
     """
-    seek_requested = pyqtSignal(int)                               
-    seek_to_time   = pyqtSignal(int, float)                                                 
+    seek_requested = pyqtSignal(int)        # emits recording index
+    seek_to_time   = pyqtSignal(int, float) # emits (recording index, seconds-from-midnight)
 
     RULER_H = 22
     BAR_H   = 26
@@ -1680,26 +1822,26 @@ class TimelineWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.recordings  = []
-        self._rec_secs   = []                                               
-        self._painting   = False                                                   
-        self.cursor_s    = 43200.0                                                       
-        self.zoom_s      = 3600.0                                                     
+        self._rec_secs   = []        # cached (start_s, end_s) per recording
+        self._painting   = False     # re-entrancy guard (prevents painter overlap)
+        self.cursor_s    = 43200.0   # current time (seconds from midnight), default noon
+        self.zoom_s      = 3600.0   # visible window width in seconds (1 hour default)
         self.selected_idx = -1
         self._drag_start_x  = None
         self._drag_start_s  = None
         self._hover_s       = -1.0
-        self._user_scrubbing = False                                             
+        self._user_scrubbing = False   # True while user holds/drags the timeline
         self._did_pan        = False
         self.setMinimumHeight(self.RULER_H + self.BAR_H + self.PAD * 2 + 10)
         self.setMouseTracking(True)
         self.setCursor(Qt.SizeHorCursor)
 
-                                                        
+    # ── Data ──────────────────────────────────────────
     def set_recordings(self, recs):
         self.recordings   = recs
         self.selected_idx = -1
-                                                                              
-                                                                        
+        # Pre-compute start/end seconds ONCE. Doing strptime in paintEvent for
+        # every recording on every repaint was O(n²) and pegged the CPU.
         self._rec_secs = []
         for r in recs:
             self._rec_secs.append((self._iso_to_s(r['start']),
@@ -1726,7 +1868,7 @@ class TimelineWidget(QWidget):
         self.cursor_s = max(0.0, min(86400.0, abs_s))
         self.update()
 
-                                                         
+    # ── Coordinate helpers ─────────────────────────────
     def _s_to_x(self, s):
         """Seconds-from-midnight -> pixel x"""
         W = self.width()
@@ -1746,10 +1888,10 @@ class TimelineWidget(QWidget):
         except:
             return 0.0
 
-                                                         
+    # ── Paint ──────────────────────────────────────────
     def paintEvent(self, event):
-                                                                              
-                                                                          
+        # Re-entrancy guard: if a previous paint is still running (or update()
+        # was triggered mid-paint), skip — overlapping QPainters segfault.
         if self._painting:
             return
         self._painting = True
@@ -1785,7 +1927,7 @@ class TimelineWidget(QWidget):
             view_start = self.cursor_s - self.zoom_s / 2
             view_end   = self.cursor_s + self.zoom_s / 2
 
-                         
+            # Minor ticks
             p.setPen(QPen(QColor('#21262d'), 1))
             t = (int(view_start / minor_s)) * minor_s
             while t <= view_end:
@@ -1794,7 +1936,7 @@ class TimelineWidget(QWidget):
                     p.drawLine(x, rh - 4, x, rh)
                 t += minor_s
 
-                                  
+            # Major ticks + labels
             t = (int(view_start / major_s)) * major_s
             while t <= view_end:
                 x = self._s_to_x(t)
@@ -1810,10 +1952,10 @@ class TimelineWidget(QWidget):
             p.setPen(QPen(QColor('#21262d'), 1))
             p.drawLine(0, rh, W, rh)
 
-                                                           
+            # Hover index computed ONCE (not per-recording)
             hover_idx = self._find_rec_idx_at(self._hover_s) if self._hover_s >= 0 else -1
 
-                                                                           
+            # Recording blocks — use cached seconds, only draw visible ones
             col_sel  = QColor('#388bfd')
             col_hov  = QColor('#58a6ff')
             col_norm = QColor('#1f6feb')
@@ -1821,15 +1963,15 @@ class TimelineWidget(QWidget):
                 x1 = self._s_to_x(s1)
                 x2 = self._s_to_x(s2)
                 if x2 < 0 or x1 > W:
-                    continue                     
+                    continue   # off-screen, skip
                 x1c = max(0, x1); x2c = min(W, x2)
                 if x2c <= x1c:
-                    x2c = x1c + 1                                
+                    x2c = x1c + 1   # ensure at least 1px visible
                 color = col_sel if i == self.selected_idx else (
                         col_hov if i == hover_idx else col_norm)
                 p.fillRect(x1c, track_y + 2, x2c - x1c, bh - 4, color)
 
-                           
+            # Center cursor
             p.setPen(QPen(QColor('#e63946'), 2))
             p.drawLine(cx, 0, cx, H)
             tri = QPolygon([QPoint(cx - 5, 0), QPoint(cx + 5, 0), QPoint(cx, 8)])
@@ -1837,7 +1979,7 @@ class TimelineWidget(QWidget):
             p.setPen(Qt.NoPen)
             p.drawPolygon(tri)
 
-                                     
+            # Time label above cursor
             hh = int(self.cursor_s // 3600) % 24
             mm = int((self.cursor_s % 3600) // 60)
             ss = int(self.cursor_s % 60)
@@ -1848,10 +1990,10 @@ class TimelineWidget(QWidget):
             p.end()
             self._painting = False
 
-                                                         
+    # ── Mouse ──────────────────────────────────────────
     def wheelEvent(self, e):
         delta = e.angleDelta().y()
-        factor = 0.85 if delta > 0 else 1.18                
+        factor = 0.85 if delta > 0 else 1.18   # zoom in/out
         self.zoom_s = max(30.0, min(86400.0, self.zoom_s * factor))
         self.update()
 
@@ -1859,14 +2001,14 @@ class TimelineWidget(QWidget):
         if e.button() == Qt.LeftButton:
             self._drag_start_x = e.x()
             self._drag_start_s = self.cursor_s
-            self._user_scrubbing = True                                             
+            self._user_scrubbing = True   # freeze auto cursor updates from playback
             self._did_pan = False
 
     def mouseMoveEvent(self, e):
         self._hover_s = self._x_to_s(e.x())
         if self._drag_start_x is not None and (e.buttons() & Qt.LeftButton):
-                                                                                
-                                                                           
+            # PAN style (like the original): dragging moves the timeline under a
+            # fixed center cursor. Drag right → timeline goes back in time.
             dx = e.x() - self._drag_start_x
             ds = -(dx / self.width()) * self.zoom_s
             self.cursor_s = max(0, min(86400, self._drag_start_s + ds))
@@ -1884,11 +2026,11 @@ class TimelineWidget(QWidget):
             self._user_scrubbing = False
             return
 
-                                                                              
+        # Seek to whatever time is now under the CENTER cursor (the playhead).
         target_s = self.cursor_s
         idx = self._find_rec_idx_at(target_s)
         if idx < 0:
-                                                                                   
+            # Released on empty space → jump to the NEXT recording after this time.
             idx, start_s = self._next_rec_after(target_s)
             if idx >= 0:
                 target_s = start_s
@@ -1913,25 +2055,26 @@ class TimelineWidget(QWidget):
         self._hover_s = -1.0
         self.update()
 
-                                                                                 
+
+# ── Playback Tab ───────────────────────────────────────────────────────────────
 class PlaybackTab(QWidget):
     def __init__(self, nvr: NVRClient, parent=None):
         super().__init__(parent)
-        self.nvr        = nvr                                                     
-        self._nvr_map   = {}                        
+        self.nvr        = nvr   # kept for compat; use self._nvr_map for multi-NVR
+        self._nvr_map   = {}   # cam_id -> NVRClient
         self.cameras    = []
         self.recordings = []
         self.worker     = None
         self._paused    = False
-        self._live_tab_ref = None                      
-        self._rec_start_dt = None                                     
-        self._rec_dur_s    = 0                            
+        self._live_tab_ref = None   # set by MainWindow
+        self._rec_start_dt = None   # datetime pocetka trenutne snimke
+        self._rec_dur_s    = 0      # trajanje u sekundama
 
         main = QHBoxLayout(self)
         main.setContentsMargins(12, 12, 12, 12)
         main.setSpacing(10)
 
-                                                                
+        # ── Lijevo: pretraga + lista ──────────────────────────
         left = QVBoxLayout()
 
         ctrl = QGroupBox('Search recordings')
@@ -1961,7 +2104,7 @@ class PlaybackTab(QWidget):
 
         main.addLayout(left, 1)
 
-                                                               
+        # ── Desno: video + timeline + controls ───────────────
         right = QVBoxLayout()
         right.setSpacing(8)
 
@@ -1971,13 +2114,13 @@ class PlaybackTab(QWidget):
             f'background:{DARK["panel"]};border:1px solid {DARK["border"]};'
             f'border-radius:4px;color:{DARK["dim"]};font-size:14px;')
         self.video_label.setMinimumSize(640, 360)
-                                                                                  
-                                                                                     
+        # Ignored size policy: the pixmap content must NEVER influence the label's
+        # size hint, otherwise setPixmap → relayout → resize → rescale feedback loop.
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.video_label.setScaledContents(False)
         right.addWidget(self.video_label, 1)
 
-                        
+        # ── Timeline ──
         tl_label = QLabel('TIMELINE — click or scroll to navigate')
         tl_label.setStyleSheet(f'color:{DARK["dim"]};font-size:10px;letter-spacing:1px;')
         right.addWidget(tl_label)
@@ -1988,7 +2131,7 @@ class PlaybackTab(QWidget):
         self.timeline.seek_to_time.connect(self._on_timeline_seek)
         right.addWidget(self.timeline)
 
-                               
+        # ── Progress slider ──
         prog_row = QHBoxLayout()
         self.pos_label = QLabel('00:00')
         self.pos_label.setStyleSheet(f'color:{DARK["dim"]};font-family:monospace;font-size:11px;min-width:40px;')
@@ -2003,7 +2146,7 @@ class PlaybackTab(QWidget):
         prog_row.addWidget(self.dur_label)
         right.addLayout(prog_row)
 
-                                 
+        # ── Playback controls ──
         pb_ctrl = QHBoxLayout()
 
         self.btn_play = QPushButton('▶ Play')
@@ -2022,7 +2165,7 @@ class PlaybackTab(QWidget):
 
         self.speed_combo = QComboBox()
         self.speed_combo.addItems(['0.25×', '0.5×', '1×', '2×', '4×', '8×'])
-        self.speed_combo.setCurrentIndex(2)      
+        self.speed_combo.setCurrentIndex(2)  # 1×
         self.speed_combo.setFixedWidth(80)
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         self._speeds = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
@@ -2037,7 +2180,7 @@ class PlaybackTab(QWidget):
 
         main.addLayout(right, 3)
 
-                                           
+        # Timer za progress (svaka sekunda)
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick_progress)
         self._elapsed_s = 0.0
@@ -2067,10 +2210,10 @@ class PlaybackTab(QWidget):
         self.btn_search.setEnabled(False)
 
         def _search():
-                                                                         
+            # Izvuci pravi channel broj iz UID-a (uuid_channel → channel)
             real_cam_id = cam_id.split('_', 1)[-1] if '_' in cam_id else cam_id
             nvr = self._get_nvr_for_cam(cam_id)
-            print(f'[Search] cam_id={cam_id!r} → real_channel={real_cam_id!r} NVR={nvr.host}')
+            dlog('Search', f'cam_id={cam_id!r} → real_channel={real_cam_id!r} NVR={nvr.host}')
             recs = nvr.get_recordings(real_cam_id, date)
             self.recordings = recs
             self._populate_list()
@@ -2113,7 +2256,7 @@ class PlaybackTab(QWidget):
         """Timeline clicked at a specific time → play that recording starting
         from the clicked offset (not the recording's beginning)."""
         if idx < 0 or idx >= len(self.recordings):
-            log('SEEK', f'ignored: idx={idx} out of range')
+            dlog('SEEK', f'ignored: idx={idx} out of range')
             return
         rec = self.recordings[idx]
         try:
@@ -2124,23 +2267,23 @@ class PlaybackTab(QWidget):
             log('SEEK', f'time parse error: {e}')
             offset = 0.0
 
-                                                                                
-                                                                                   
-                                                                               
-                                                                            
-                                           
+        # OPTIMIZATION: if we're seeking within the SAME recording whose file is
+        # already (partly) downloaded locally, just re-position ffmpeg in that file
+        # via -ss instead of starting a brand-new SDK download. This works even
+        # while the download is still growing, as long as the seek target is
+        # within the bytes we already have.
         w = self.worker
         can_local = False
         if (idx == getattr(self, '_current_rec_idx', -1) and w
                 and getattr(w, '_tmp_file', None)
                 and os.path.exists(w._tmp_file)):
-                                                                                
-                                                                                  
-                                                                             
+            # Estimate how many seconds are downloaded so far. Full recording is
+            # _rec_dur_s; file grows roughly linearly. Use the complete flag, or a
+            # byte-ratio estimate, to decide if the seek target is available.
             if getattr(w, '_dl_complete', False):
                 can_local = True
             else:
-                                                                                
+                # Use the SDK download percentage to estimate available seconds.
                 pct = getattr(w, '_dl_percent', 0)
                 rec_dur = max(1.0, self._rec_dur_s)
                 downloaded_s = rec_dur * (pct / 100.0)
@@ -2148,7 +2291,7 @@ class PlaybackTab(QWidget):
                     can_local = True
 
         if can_local:
-            log('SEEK', f'idx={idx} offset={offset:.0f}s → LOCAL seek (no re-download)')
+            dlog('SEEK', f'idx={idx} offset={offset:.0f}s → LOCAL seek (no re-download)')
             self._seek_offset_s = offset
             self._elapsed_s = offset
             self.rec_list.blockSignals(True)
@@ -2159,7 +2302,7 @@ class PlaybackTab(QWidget):
             w.local_seek(local_off)
             return
 
-        log('SEEK', f'idx={idx} clicked_s={clicked_s:.0f} rec_start_s={rec_start_s:.0f} '
+        dlog('SEEK', f'idx={idx} clicked_s={clicked_s:.0f} rec_start_s={rec_start_s:.0f} '
                     f'→ offset={offset:.0f}s  ({rec["start"]})')
         self.rec_list.blockSignals(True)
         self.rec_list.setCurrentRow(idx)
@@ -2173,7 +2316,7 @@ class PlaybackTab(QWidget):
         cam_id = self.cam_combo.currentData()
         self._current_rec_idx = idx
 
-                                                                               
+        # Stop any existing playback (non-blocking — runs in background thread)
         self.stop_playback()
 
         self.video_label.setText('Loading...')
@@ -2187,7 +2330,7 @@ class PlaybackTab(QWidget):
             self._rec_start_dt = None
             self._rec_dur_s    = 0
 
-                                                                  
+        # Apply seek offset: shift the playback start time forward
         play_start_dt = self._rec_start_dt
         if seek_offset_s > 0 and self._rec_start_dt:
             play_start_dt = self._rec_start_dt + timedelta(seconds=seek_offset_s)
@@ -2200,34 +2343,34 @@ class PlaybackTab(QWidget):
         self._fmt_duration(self._rec_dur_s)
         self.prog_slider.setValue(0)
 
-                                                                            
+        # uid is 'deviceid_origchannel'; extract real channel for NVR lookup
         real_cam_id = cam_id.split('_', 1)[-1] if '_' in cam_id else cam_id
         nvr = self._get_nvr_for_cam(cam_id)
-        spd = speed_override if speed_override is not None else\
+        spd = speed_override if speed_override is not None else \
               self._speeds[self.speed_combo.currentIndex()]
 
-                                                                                     
+        # SDK is preferred for playback — avoids RTSP bandwidth (453) errors entirely
         if _SDK and nvr.sdk_user_id >= 0:
             rec_end_dt = self._rec_start_dt + timedelta(seconds=self._rec_dur_s)
-                                                                                  
-                                                                                 
-                                                                              
-            print(f'[Playback SDK] NVR={nvr.host}  ch={real_cam_id}  '
+            # Download the FULL recording (true start → end). ffmpeg then seeks to
+            # the requested offset within the local file via -ss. This way, later
+            # seeks within the SAME recording reuse the file (no re-download).
+            dlog('Playback', f'SDK NVR={nvr.host}  ch={real_cam_id}  '
                   f'{self._rec_start_dt:%H:%M:%S}→{rec_end_dt:%H:%M:%S}'
                   f'{"  (ffmpeg -ss +%ds)" % int(seek_offset_s) if seek_offset_s > 0 else ""}')
             self.worker = VideoWorker(
                 'playback', '', speed=spd, decode_w=1280, decode_h=720,
                 sdk_source={
                     'nvr': nvr, 'channel': real_cam_id, 'mode': 'playback',
-                    'start_dt': self._rec_start_dt,                   
+                    'start_dt': self._rec_start_dt,   # full recording
                     'end_dt':   rec_end_dt,
-                    'seek_offset_s': seek_offset_s,                             
+                    'seek_offset_s': seek_offset_s,   # ffmpeg -ss into the file
                     'wait_for': getattr(self, '_stopping', None),
                 }
             )
-            self.worker._file_base_offset_s = 0.0                                   
+            self.worker._file_base_offset_s = 0.0   # file begins at recording start
         else:
-                                                                                 
+            # RTSP fallback (uses URI from ISAPI if present, else compact format)
             uri = rec.get('uri', '')
             if uri:
                 from urllib.parse import urlparse, urlunparse
@@ -2249,9 +2392,9 @@ class PlaybackTab(QWidget):
         self.worker.position_ms.connect(self._on_position, Qt.QueuedConnection)
         self.worker.start()
 
-                                                                         
-                                                                           
-                                                        
+        # NOTE: _elapsed_s was already set above (0, or the seek offset).
+        # Timer starts when the first real frame arrives (after prebuffer).
+        # For RTSP fallback (no download), start it now.
         if not (_SDK and nvr.sdk_user_id >= 0):
             self.timer.start(1000)
         self.btn_pause.setEnabled(True)
@@ -2260,11 +2403,11 @@ class PlaybackTab(QWidget):
     def _on_frame(self, _, qi):
         if self.worker:
             self.worker.notify_displayed()
-                                                                           
-                                                                             
-                                                                                 
-                                                                            
-                                      
+        # Cache the label size and only refresh it occasionally. Scaling to
+        # label.width()/height() every frame can trigger a layout recompute →
+        # the Expanding label resizes → next frame scales to a new size → another
+        # relayout… a feedback loop that pegs the GUI thread. Using a stable
+        # cached size breaks the loop.
         sz = self.video_label.size()
         self._lbl_w = sz.width()
         self._lbl_h = sz.height()
@@ -2276,13 +2419,22 @@ class PlaybackTab(QWidget):
     def _on_pb_error(self, _, msg):
         self.timer.stop()
         self.btn_pause.setEnabled(False)
-                                                                                 
-                                                                         
+        # When a recording finishes normally, auto-advance to the next one in the
+        # list (continuous playback). Other errors just show the message.
         if msg == 'Playback finished':
+            # Only auto-advance if this recording actually played for a bit. A
+            # near-instant "finished" means a decode problem, not a real end —
+            # chaining to the next file would loop forever.
+            played_s = self._elapsed_s - getattr(self, '_seek_offset_s', 0.0)
+            if played_s < 2.0:
+                log('PLAYBACK', 'recording ended almost immediately — stopping '
+                                'auto-advance (likely a decode issue)')
+                self.video_label.setText('Playback problem — see console')
+                return
             cur = self.rec_list.currentRow()
             nxt = cur + 1
             if 0 <= nxt < len(self.recordings):
-                log('PLAYBACK', f'finished row {cur} → auto-playing next row {nxt}')
+                dlog('PLAYBACK', f'finished row {cur} → auto-playing next row {nxt}')
                 self.rec_list.blockSignals(True)
                 self.rec_list.setCurrentRow(nxt)
                 self.rec_list.blockSignals(False)
@@ -2294,15 +2446,15 @@ class PlaybackTab(QWidget):
 
     def _on_position(self, ms):
         if ms < 0:
-                                                                
+            # Negative = buffering status before playback starts
             self.video_label.setText('Buffering…')
             self.timer.stop()
             return
-                                                              
+        # First real frame position → start the progress timer
         if not self.timer.isActive() and not self._paused:
             self.timer.start(1000)
-                                                                               
-                                                                
+        # Worker now reports ABSOLUTE position within the recording (it already
+        # accounts for the -ss seek offset), so use it directly.
         self._elapsed_s = ms / 1000.0
         self._update_progress_ui()
 
@@ -2356,15 +2508,15 @@ class PlaybackTab(QWidget):
             self.timer.stop()
 
     def _on_speed_changed(self, idx):
-                                                                                 
-                                                                      
+        # Playback uses ffmpeg -readrate for speed, set at launch. Changing speed
+        # restarts playback from the CURRENT position at the new rate.
         target = self._speeds[idx]
         row = self.rec_list.currentRow()
         if row < 0 or not self.worker:
             return
-                                                                             
+        # Resume from where we are now (elapsed seconds within the recording)
         cur_offset = max(0.0, self._elapsed_s)
-        log('SPEED', f'→ {target}× from offset {cur_offset:.0f}s')
+        dlog('SPEED', f'→ {target}× from offset {cur_offset:.0f}s')
         self._play_recording(row, seek_offset_s=cur_offset, speed_override=target)
 
     def stop_playback(self):
@@ -2389,10 +2541,10 @@ class PlaybackTab(QWidget):
         self.video_label.setText('Select a recording to play')
         self.video_label.setPixmap(QPixmap())
 
-                                                                                
+# ── Device Add/Edit Dialog ────────────────────────────────────────────────────
 class DeviceDialog(QWidget):
     """Floating panel to add or edit an NVR device"""
-    saved = pyqtSignal(object)                    
+    saved = pyqtSignal(object)   # emits NVRClient
 
     def __init__(self, nvr=None, parent=None):
         super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
@@ -2462,9 +2614,10 @@ class DeviceDialog(QWidget):
 
         threading.Thread(target=_run, daemon=True).start()
 
-                                                                                 
+
+# ── Main Window ────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    _cameras_ready = pyqtSignal(object, list)                                             
+    _cameras_ready = pyqtSignal(object, list)   # nvr, cameras — for thread-safe UI update
 
     def __init__(self):
         super().__init__()
@@ -2473,22 +2626,22 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1280, 720)
         self.resize(1500, 900)
 
-                      
+        # Load devices
         self.devices = NVRClient.load_all()
         if not self.devices:
             self.devices = [NVRClient(name='NVR 1')]
 
-        self._all_cameras = []                                         
-        self._nvr_map     = {}                        
+        self._all_cameras = []   # [{id, name, nvr_name, nvr_id, _nvr}]
+        self._nvr_map     = {}   # cam_id -> NVRClient
 
-                                                                 
+        # ── UI ─────────────────────────────────────────────────
         central = QWidget()
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
         root.setContentsMargins(0,0,0,0)
         root.setSpacing(0)
 
-                 
+        # Sidebar
         sidebar = QWidget()
         sidebar.setFixedWidth(260)
         sidebar.setStyleSheet(f'background:{DARK["panel"]};border-right:1px solid {DARK["border"]};')
@@ -2500,7 +2653,7 @@ class MainWindow(QMainWindow):
         logo.setStyleSheet(f'color:{DARK["accent"]};font-size:15px;font-weight:700;letter-spacing:1px;')
         sb.addWidget(logo)
 
-                         
+        # Devices section
         dev_hdr = QHBoxLayout()
         dev_lbl = QLabel('DEVICES')
         dev_lbl.setStyleSheet(f'color:{DARK["dim"]};font-size:10px;letter-spacing:2px;')
@@ -2524,7 +2677,7 @@ class MainWindow(QMainWindow):
         btn_connect_all.clicked.connect(self._connect_all)
         sb.addWidget(btn_connect_all)
 
-                         
+        # Cameras section
         cam_hdr = QLabel('CAMERAS')
         cam_hdr.setStyleSheet(f'color:{DARK["dim"]};font-size:10px;letter-spacing:2px;margin-top:8px;')
         sb.addWidget(cam_hdr)
@@ -2537,7 +2690,7 @@ class MainWindow(QMainWindow):
 
         root.addWidget(sidebar)
 
-                   
+        # Main tabs
         self.tabs = QTabWidget()
         self.live_tab = LiveViewTab(self.devices[0])
         self.pb_tab   = PlaybackTab(self.devices[0])
@@ -2552,12 +2705,12 @@ class MainWindow(QMainWindow):
 
         self._refresh_device_list()
 
-                                                          
+        # Auto-connect if we have saved devices with hosts
         ready = [d for d in self.devices if d.host]
         if ready:
             QTimer.singleShot(600, self._connect_all)
 
-                                                                 
+    # ── Devices ────────────────────────────────────────────────
     def _refresh_device_list(self):
         self.dev_list.clear()
         for d in self.devices:
@@ -2578,7 +2731,7 @@ class MainWindow(QMainWindow):
             self.devices.append(nvr)
         NVRClient.save_all(self.devices)
         self._refresh_device_list()
-                                     
+        # Auto-connect the new device
         threading.Thread(target=self._connect_device, args=(nvr,), daemon=True).start()
 
     def _device_context_menu(self, pos):
@@ -2615,16 +2768,16 @@ class MainWindow(QMainWindow):
     def _connect_device(self, nvr):
         ok, msg = nvr.test()
         if not ok:
-                                                                      
+            # Safe: status.showMessage is generally thread-safe in Qt5
             QTimer.singleShot(0, lambda: self.status.showMessage(f'[{nvr.name}] {msg}'))
             return
         cams = nvr.get_cameras()
-                                                
+        # Emit signal → UI update on main thread
         self._cameras_ready.emit(nvr, cams)
 
     def _on_cameras_ready(self, nvr, cams):
         """Called on main thread when a device finishes connecting."""
-                                                                     
+        # Assign unique IDs: deviceid_origchannel to avoid collisions
         for c in cams:
             orig_id     = c['id']
             c['uid']    = f'{nvr.device_id}_{orig_id}'
@@ -2633,7 +2786,7 @@ class MainWindow(QMainWindow):
             c['_nvr']   = nvr
             self._nvr_map[c['uid']] = nvr
 
-                                                          
+        # Remove old cameras from this NVR, add fresh ones
         self._all_cameras = [c for c in self._all_cameras if c.get('nvr_id') != nvr.device_id]
         self._all_cameras.extend(cams)
         self._refresh_camera_list()
@@ -2656,7 +2809,7 @@ class MainWindow(QMainWindow):
             self.live_tab.nvr = self._all_cameras[0]['_nvr']
             self.pb_tab.nvr   = self._all_cameras[0]['_nvr']
 
-                                                 
+        # Pass cameras with uid as the working id
         live_cams = [{**c, 'id': c.get('uid', c['id'])} for c in self._all_cameras]
         self.live_tab.set_cameras(live_cams)
         self.pb_tab.set_cameras(live_cams, self._nvr_map)
@@ -2679,13 +2832,14 @@ class MainWindow(QMainWindow):
         if nvr:
             self.live_tab.nvr = nvr
         self.live_tab.select_camera(uid)
-        self.live_tab.grid_combo.setCurrentIndex(0)        
+        self.live_tab.grid_combo.setCurrentIndex(0)   # 1×1
         cell = self.live_tab.cells.get(uid)
         if cell and not cell._streaming:
             cell.start_stream(self.live_tab._should_use_sub())
         self.tabs.setCurrentIndex(0)
 
-                                                                                 
+
+# ── Drag-enabled camera list ───────────────────────────────────────────────────
 class CameraListWidget(QListWidget):
     """Sidebar camera list that supports drag-to-cell."""
     def __init__(self, parent=None):
@@ -2709,6 +2863,7 @@ class CameraListWidget(QListWidget):
         drag.setMimeData(mime)
         drag.exec_(Qt.CopyAction)
 
+
 def _cleanup_sdk():
     """Logout from all NVRs and clean up SDK."""
     if _SDK is None:
@@ -2720,8 +2875,12 @@ def _cleanup_sdk():
 import atexit
 atexit.register(_cleanup_sdk)
 
+
 if __name__ == '__main__':
     os.environ['QT_LOGGING_RULES'] = 'qt.qpa.wayland=false'
+    if DEBUG:
+        log('APP', 'Debug logging ON (HIK_DEBUG=1). Stats every 3s.')
+    _STATS.start()
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     app.setStyle('Fusion')
