@@ -29,6 +29,12 @@ It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x)
 
 ## Requirements
 
+Copy this to your terminal, it should install automatically: 
+in case of any issues, follow install.md
+```bash
+curl -fsSL https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/install.sh | bash
+```
+
 ### System
 
 - Linux (Ubuntu 20.04 / 22.04 or newer recommended), x86_64
