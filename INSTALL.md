@@ -10,7 +10,7 @@ Open a terminal and run:
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-pip ffmpeg git
+sudo apt install python3 python3-pip ffmpeg git python3.14-venv
 ```
 
 ---
