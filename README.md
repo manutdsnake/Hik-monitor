@@ -36,7 +36,7 @@ It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x)
 - ffmpeg (for playback)
 
 ```bash
-sudo apt install ffmpeg python3 python3-pip
+sudo apt install ffmpeg python3 python3-pip python3.14-venv
 ```
 
 ### Python packages
