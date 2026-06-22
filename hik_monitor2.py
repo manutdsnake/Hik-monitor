@@ -180,10 +180,11 @@ from PyQt5.QtWidgets import (
     QTabWidget, QMessageBox, QToolBar, QAction, QSlider, QStyle
 )
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QDate, QSize, QMutex, QMutexLocker
+    Qt, QThread, pyqtSignal, QTimer, QDate, QSize, QMutex, QMutexLocker,
+    QPoint, QPointF, QRectF
 )
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPalette, QIcon
+    QImage, QPixmap, QFont, QColor, QPalette, QIcon, QPainter
 )
 
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
@@ -1392,6 +1393,223 @@ class VideoWorker(QThread):
             except: pass
 
 # ── Fullscreen prozor ─────────────────────────────────────────────────────────
+class ZoomableVideoLabel(QLabel):
+    """A QLabel replacement for video display that supports mouse-wheel zoom
+    (centred on the cursor) and click-drag panning. Call set_frame(QImage)
+    each frame instead of setPixmap(). When zoom == 1.0 it behaves like the
+    old label (full frame, KeepAspectRatio, centred)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._img = None          # current QImage (full-res decoded frame)
+        self._zoom = 1.0          # 1.0 = fit, >1 = zoomed in
+        self._min_zoom = 1.0
+        self._max_zoom = 8.0
+        # Pan offset in *image* pixels: the image-space point shown at widget
+        # centre. Starts at image centre.
+        self._cx = 0.5            # normalized 0..1 focus point (x)
+        self._cy = 0.5            # normalized 0..1 focus point (y)
+        self._panning = False
+        self._pan_last = QPoint()
+        # When True (grid cells), clicks/double-clicks are forwarded to the
+        # parent so single-click-select and double-click-fullscreen still work;
+        # panning only engages once zoomed in.
+        self._forward_clicks = False
+        self.setMouseTracking(True)
+
+    def set_forward_clicks(self, on):
+        self._forward_clicks = on
+
+    # -- public API ---------------------------------------------------------
+    def set_frame(self, qimg: QImage):
+        """Supply a new video frame (full resolution)."""
+        self._img = qimg
+        self.update()
+
+    def clear_frame(self):
+        self._img = None
+        self.reset_zoom()
+        self.update()
+
+    def reset_zoom(self):
+        self._zoom = 1.0
+        self._cx = 0.5
+        self._cy = 0.5
+        self.update()
+
+    def has_zoom(self):
+        return self._zoom > 1.001
+
+    # -- zoom / pan input ---------------------------------------------------
+    def wheelEvent(self, e):
+        if self._img is None:
+            return
+        delta = e.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.25 if delta > 0 else 1 / 1.25
+        old_zoom = self._zoom
+        new_zoom = max(self._min_zoom, min(self._max_zoom, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+
+        # Zoom centred on cursor: keep the image point under the cursor fixed.
+        # Compute image-space point under cursor at old zoom, then set focus so
+        # it stays under the cursor at the new zoom.
+        ip = self._widget_to_img(e.pos(), old_zoom)
+        if ip is not None:
+            iw = self._img.width()
+            ih = self._img.height()
+            # Where is the cursor within the widget, normalized -0.5..0.5
+            disp = self._display_rect(old_zoom)
+            if disp.width() > 0 and disp.height() > 0:
+                self._zoom = new_zoom
+                # New focus so that image point ip maps back under the cursor
+                cur = e.pos()
+                disp2 = self._display_rect(new_zoom)
+                # fraction of cursor across the *visible* viewport
+                fx = (cur.x() - self.width() / 2) / self.width()
+                fy = (cur.y() - self.height() / 2) / self.height()
+                # visible span in normalized image coords at new zoom
+                vis_w = self._visible_frac_w(new_zoom)
+                vis_h = self._visible_frac_h(new_zoom)
+                self._cx = ip[0] / iw - fx * vis_w
+                self._cy = ip[1] / ih - fy * vis_h
+                self._clamp_focus(new_zoom)
+        else:
+            self._zoom = new_zoom
+            self._clamp_focus(new_zoom)
+
+        if self._zoom <= 1.001:
+            self.reset_zoom()
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.has_zoom():
+            self._panning = True
+            self._pan_last = e.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self._forward_clicks:
+            e.ignore()            # let the parent VideoCell handle selection
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._img is not None:
+            dx = e.pos().x() - self._pan_last.x()
+            dy = e.pos().y() - self._pan_last.y()
+            self._pan_last = e.pos()
+            # Convert pixel drag to normalized focus shift (inverted: drag right
+            # moves image right => focus moves left).
+            self._cx -= dx / self.width() * self._visible_frac_w(self._zoom)
+            self._cy -= dy / self.height() * self._visible_frac_h(self._zoom)
+            self._clamp_focus(self._zoom)
+            self.update()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._panning:
+            self._panning = False
+            self.setCursor(Qt.OpenHandCursor if self.has_zoom() else Qt.ArrowCursor)
+        elif self._forward_clicks:
+            e.ignore()
+        else:
+            super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        # In grid mode, double-click belongs to the cell (fullscreen), not zoom.
+        if self._forward_clicks:
+            e.ignore()
+            return
+        # Standalone (fullscreen/playback): double-click resets zoom.
+        if self.has_zoom():
+            self.reset_zoom()
+            self.setCursor(Qt.ArrowCursor)
+        else:
+            super().mouseDoubleClickEvent(e)
+
+    # -- geometry helpers ---------------------------------------------------
+    def _visible_frac_w(self, zoom):
+        return 1.0 / zoom
+
+    def _visible_frac_h(self, zoom):
+        return 1.0 / zoom
+
+    def _clamp_focus(self, zoom):
+        half_w = self._visible_frac_w(zoom) / 2
+        half_h = self._visible_frac_h(zoom) / 2
+        self._cx = max(half_w, min(1 - half_w, self._cx))
+        self._cy = max(half_h, min(1 - half_h, self._cy))
+
+    def _display_rect(self, zoom):
+        """The rect (in widget coords) where the full frame would be drawn at
+        zoom=1 with KeepAspectRatio (letterboxed)."""
+        if self._img is None:
+            return QRectF()
+        iw, ih = self._img.width(), self._img.height()
+        ww, wh = self.width(), self.height()
+        if iw == 0 or ih == 0:
+            return QRectF()
+        scale = min(ww / iw, wh / ih)
+        dw, dh = iw * scale, ih * scale
+        x = (ww - dw) / 2
+        y = (wh - dh) / 2
+        return QRectF(x, y, dw, dh)
+
+    def _widget_to_img(self, pos, zoom):
+        """Map a widget-space point to image-space pixels at the given zoom."""
+        if self._img is None:
+            return None
+        iw, ih = self._img.width(), self._img.height()
+        vis_w = self._visible_frac_w(zoom)
+        vis_h = self._visible_frac_h(zoom)
+        # Source rect (in normalized image coords) currently shown:
+        sx0 = self._cx - vis_w / 2
+        sy0 = self._cy - vis_h / 2
+        fx = pos.x() / self.width()
+        fy = pos.y() / self.height()
+        nx = sx0 + fx * vis_w
+        ny = sy0 + fy * vis_h
+        return (nx * iw, ny * ih)
+
+    # -- rendering ----------------------------------------------------------
+    def paintEvent(self, e):
+        if self._img is None:
+            super().paintEvent(e)   # show text placeholder etc.
+            return
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        iw, ih = self._img.width(), self._img.height()
+        if iw == 0 or ih == 0:
+            return
+
+        if self._zoom <= 1.001:
+            # Fit whole frame, KeepAspectRatio, centred (old behaviour).
+            target = self._display_rect(1.0)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawImage(target, self._img, QRectF(0, 0, iw, ih))
+        else:
+            # Show a sub-region of the image scaled to fill the widget.
+            vis_w = self._visible_frac_w(self._zoom)
+            vis_h = self._visible_frac_h(self._zoom)
+            sx = (self._cx - vis_w / 2) * iw
+            sy = (self._cy - vis_h / 2) * ih
+            sw = vis_w * iw
+            sh = vis_h * ih
+            src = QRectF(sx, sy, sw, sh)
+            # Keep aspect ratio inside the widget (letterbox if needed).
+            target = self._display_rect(1.0)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawImage(target, self._img, src)
+
+            # Small zoom indicator in the corner.
+            p.setPen(QColor(255, 255, 255, 200))
+            f = p.font(); f.setPixelSize(11); p.setFont(f)
+            p.fillRect(6, 6, 54, 18, QColor(0, 0, 0, 140))
+            p.drawText(10, 19, f'{self._zoom:.1f}×')
+
+
 class FullscreenWindow(QWidget):
     def __init__(self, channel_id, name, nvr, parent=None):
         super().__init__(parent)
@@ -1402,7 +1620,7 @@ class FullscreenWindow(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.label = QLabel(f'⏳ Connecting {name}...')
+        self.label = ZoomableVideoLabel(f'⏳ Connecting {name}...')
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet('color: #555; font-size: 14px;')
         lay.addWidget(self.label)
@@ -1417,10 +1635,7 @@ class FullscreenWindow(QWidget):
     def _on_frame(self, _, qi):
         if self.worker:
             self.worker.notify_displayed()
-        pm = QPixmap.fromImage(qi).scaled(
-            self.label.width(), self.label.height(),
-            Qt.KeepAspectRatio, Qt.FastTransformation)
-        self.label.setPixmap(pm)
+        self.label.set_frame(qi)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Escape, Qt.Key_F, Qt.Key_Q):
@@ -1454,12 +1669,13 @@ class VideoCell(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Video label
-        self.video_label = QLabel()
+        # Video label (zoomable)
+        self.video_label = ZoomableVideoLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet('border: none; background: transparent;')
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.video_label.setScaledContents(False)
+        self.video_label.set_forward_clicks(True)  # grid: click selects, dbl=fullscreen
         lay.addWidget(self.video_label)
 
         # Placeholder
@@ -1516,7 +1732,7 @@ class VideoCell(QFrame):
 
         # Clear any stale frame from a previous camera so we don't show its last
         # image while the new stream spins up.
-        self.video_label.setPixmap(QPixmap())
+        self.video_label.clear_frame()
         self.video_label.hide()
         self.placeholder.show()
 
@@ -1576,11 +1792,7 @@ class VideoCell(QFrame):
             self.worker.notify_displayed()
         if not self._streaming:
             return
-        pm = QPixmap.fromImage(qi).scaled(
-            self.video_label.width(), self.video_label.height(),
-            Qt.KeepAspectRatio, Qt.FastTransformation
-        )
-        self.video_label.setPixmap(pm)
+        self.video_label.set_frame(qi)
         if not self.video_label.isVisible():
             self.placeholder.hide()
             self.video_label.show()
@@ -2108,7 +2320,7 @@ class PlaybackTab(QWidget):
         right = QVBoxLayout()
         right.setSpacing(8)
 
-        self.video_label = QLabel('Select a recording to play')
+        self.video_label = ZoomableVideoLabel('Select a recording to play')
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet(
             f'background:{DARK["panel"]};border:1px solid {DARK["border"]};'
@@ -2319,6 +2531,7 @@ class PlaybackTab(QWidget):
         # Stop any existing playback (non-blocking — runs in background thread)
         self.stop_playback()
 
+        self.video_label.clear_frame()
         self.video_label.setText('Loading...')
         self._paused = False
 
@@ -2403,18 +2616,7 @@ class PlaybackTab(QWidget):
     def _on_frame(self, _, qi):
         if self.worker:
             self.worker.notify_displayed()
-        # Cache the label size and only refresh it occasionally. Scaling to
-        # label.width()/height() every frame can trigger a layout recompute →
-        # the Expanding label resizes → next frame scales to a new size → another
-        # relayout… a feedback loop that pegs the GUI thread. Using a stable
-        # cached size breaks the loop.
-        sz = self.video_label.size()
-        self._lbl_w = sz.width()
-        self._lbl_h = sz.height()
-        pm = QPixmap.fromImage(qi).scaled(
-            self._lbl_w, self._lbl_h,
-            Qt.KeepAspectRatio, Qt.FastTransformation)
-        self.video_label.setPixmap(pm)
+        self.video_label.set_frame(qi)
 
     def _on_pb_error(self, _, msg):
         self.timer.stop()
@@ -2539,7 +2741,7 @@ class PlaybackTab(QWidget):
         self.prog_slider.setValue(0)
         self.pos_label.setText('00:00')
         self.video_label.setText('Select a recording to play')
-        self.video_label.setPixmap(QPixmap())
+        self.video_label.clear_frame()
 
 # ── Device Add/Edit Dialog ────────────────────────────────────────────────────
 class DeviceDialog(QWidget):
