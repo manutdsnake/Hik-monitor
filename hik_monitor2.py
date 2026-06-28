@@ -150,6 +150,7 @@ if _VAAPI_NODE:
     print(f'[App] VAAPI GPU decode available at {_VAAPI_NODE} — playback will use GPU')
 else:
     print('[App] VAAPI HEVC decode not available — playback will use CPU decode')
+_SDK = None   # safe default if the SDK fails to load (ONVIF/RTSP still work)
 try:
     from hik_sdk import HCNetSDK
     try:
@@ -177,13 +178,15 @@ from PyQt5.QtWidgets import (
     QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QSpinBox,
     QDateEdit, QListWidget, QListWidgetItem, QSplitter, QFrame,
     QGroupBox, QScrollArea, QSizePolicy, QProgressBar, QStatusBar,
-    QTabWidget, QMessageBox, QToolBar, QAction, QSlider, QStyle
+    QTabWidget, QMessageBox, QToolBar, QAction, QSlider, QStyle,
+    QTreeWidget, QTreeWidgetItem
 )
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QDate, QSize, QMutex, QMutexLocker
+    Qt, QThread, pyqtSignal, QTimer, QDate, QSize, QMutex, QMutexLocker,
+    QPoint, QPointF, QRectF
 )
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPalette, QIcon
+    QImage, QPixmap, QFont, QColor, QPalette, QIcon, QPainter
 )
 
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
@@ -251,6 +254,15 @@ QListWidget {{
 QListWidget::item {{ padding: 8px; border-bottom: 1px solid {DARK['border']}; }}
 QListWidget::item:selected {{ background: {DARK['accent']}33; color: white; border-left: 2px solid {DARK['accent']}; }}
 QListWidget::item:hover {{ background: #21262d; }}
+QTreeWidget {{
+    background: {DARK['panel']};
+    border: 1px solid {DARK['border']};
+    border-radius: 3px;
+    outline: none;
+}}
+QTreeWidget::item {{ padding: 5px; }}
+QTreeWidget::item:selected {{ background: {DARK['accent']}33; color: white; }}
+QTreeWidget::item:hover {{ background: #21262d; }}
 QTabWidget::pane {{ border: 1px solid {DARK['border']}; border-top: none; }}
 QTabBar::tab {{
     background: {DARK['bg']};
@@ -286,6 +298,10 @@ class NVRClient:
         # SDK state — populated by sdk_login() after ISAPI connect succeeds
         self.sdk_user_id  = -1
         self.start_dchan  = 33   # IP channel base, populated from SDK device info
+        # True for genuine Hikvision (V30 login, SDK file-download works → playback
+        # via download path with seeking). False for OEM rebrands (V40/ISAPI login)
+        # whose SDK rejects the download API → playback must stream via PlayM4.
+        self.sdk_supports_download = True
 
     @classmethod
     def load_all(cls):
@@ -299,38 +315,72 @@ class NVRClient:
                     # Legacy single-device format
                     devices = [data]
                 for d in devices:
-                    c = cls(d.get('id'), d.get('name', 'NVR'))
-                    c.host     = d.get('host', '')
-                    c.port     = d.get('port', 80)
-                    c.username = d.get('username', 'admin')
-                    c.password = d.get('password', '')
+                    dtype = d.get('type')
+                    if dtype == 'onvif':
+                        c = ONVIFClient(d.get('id'), d.get('name', 'ONVIF Camera'))
+                        c.xaddr = d.get('xaddr')
+                        c.username = d.get('username', '')
+                        c.password = d.get('password', '')
+                        c.use_sub = d.get('use_sub', False)
+                        c.extra_channels = d.get('extra_channels', []) or []
+                    elif dtype == 'rtsp':
+                        c = ManualRTSPClient(d.get('id'), d.get('name', 'RTSP Camera'))
+                        c.url = d.get('url', '')
+                    else:
+                        c = cls(d.get('id'), d.get('name', 'NVR'))
+                        c.username = d.get('username', 'admin')
+                        c.password = d.get('password', '')
+                    c.host = d.get('host', '')
+                    c.port = d.get('port', 80)
                     clients.append(c)
             except: pass
         return clients
 
     @staticmethod
     def save_all(clients):
-        CONFIG_FILE.write_text(json.dumps({'devices': [
-            {'id': c.device_id, 'name': c.name, 'host': c.host,
-             'port': c.port, 'username': c.username, 'password': c.password}
-            for c in clients
-        ]}, indent=2))
+        CONFIG_FILE.write_text(json.dumps(
+            {'devices': [c.to_dict() for c in clients]}, indent=2))
 
     def to_dict(self):
         return {'id': self.device_id, 'name': self.name, 'host': self.host,
                 'port': self.port, 'username': self.username, 'password': self.password}
 
     def sdk_login(self):
-        """Login via Hikvision SDK on port 8000. Used for playback to avoid
-        RTSP bandwidth limits. Returns True on success."""
+        """Login via Hikvision SDK. Enables native PlayM4 decode (handles the
+        non-standard H.264/H.265 some OEM cameras emit, which ffmpeg renders
+        green/garbled). Returns True on success.
+
+        Two login paths are tried, in order:
+          1. V40 ISAPI-mode on the HTTP port — required by OEM rebrands
+             (Safire/Sapphire by Hik) that reject the legacy login on 8000.
+          2. V30 private-protocol on port 8000 — the classic Hikvision path."""
         if _SDK is None:
             return False
         if self.sdk_user_id >= 0:
             return True   # already logged in
+
+        # Path 1: legacy V30 private-protocol login on the SDK port (8000).
+        # This is the path genuine Hikvision NVRs use — try it FIRST so their
+        # behaviour (incl. byStartDChan channel base) is unchanged. It fails
+        # fast on OEM rebrands, which then fall through to Path 2.
         try:
             self.sdk_user_id, info = _SDK.login(self.host, 8000, self.username, self.password)
             self.start_dchan = info.byStartDChan or 33
-            print(f'[SDK] {self.name} ({self.host}) → user_id={self.sdk_user_id}  '
+            self.sdk_supports_download = True
+            print(f'[SDK] {self.name} ({self.host}) V30/8000 → user_id={self.sdk_user_id}  '
+                  f'IP chan base={self.start_dchan}')
+            return True
+        except Exception as e_v30:
+            print(f'[SDK] V30/8000 login to {self.host} failed: {e_v30} — trying V40/ISAPI')
+
+        # Path 2: V40 ISAPI-mode login over the HTTP port — required by OEM
+        # rebrands (Safire/Sapphire by Hik) that reject the V30 login on 8000.
+        try:
+            self.sdk_user_id, info = _SDK.login_v40(
+                self.host, self.port, self.username, self.password, login_mode=1)
+            self.start_dchan = info.byStartDChan or 1
+            self.sdk_supports_download = False   # OEM: stream via PlayM4, no download
+            print(f'[SDK] {self.name} ({self.host}) V40/ISAPI → user_id={self.sdk_user_id}  '
                   f'IP chan base={self.start_dchan}')
             return True
         except Exception as e:
@@ -383,25 +433,26 @@ class NVRClient:
     def get_cameras(self):
         import xml.etree.ElementTree as ET
 
-        def find_text(el, tag, ns):
-            """Sigurno dohvati tekst iz XML elementa — bez DeprecationWarning"""
-            found = el.find(f'h:{tag}', ns)
+        def find_text(el, tag, deep=False):
+            """Dohvati tekst djeteta po LOKALNOM imenu, neovisno o XML namespace-u.
+            Hikvision koristi namespace hikvision.com, a OEM rebrandovi (npr.
+            Safire/Sapphire 'std-cgi.com') koriste drugi — zato matchamo
+            wildcardom {*} umjesto fiksnog namespacea. deep=True traži i ugniježđene."""
+            prefix = './/' if deep else ''
+            found = el.find(f'{prefix}{{*}}{tag}')
             if found is None:
-                found = el.find(tag)
+                found = el.find(f'{prefix}{tag}')
             return found.text.strip() if found is not None and found.text else ''
 
         cameras = []
         try:
             xml = self.get('ContentMgmt/InputProxy/channels')
             root = ET.fromstring(xml)
-            ns = {'h': 'http://www.hikvision.com/ver20/XMLSchema'}
-            channels = root.findall('.//h:InputProxyChannel', ns)
-            if not channels:
-                channels = root.findall('.//InputProxyChannel')
+            channels = root.findall('.//{*}InputProxyChannel')
             for ch in channels:
-                cid  = find_text(ch, 'id', ns)
-                name = find_text(ch, 'name', ns)
-                ip   = find_text(ch, 'ipAddress', ns)
+                cid  = find_text(ch, 'id')
+                name = find_text(ch, 'name')
+                ip   = find_text(ch, 'ipAddress', deep=True)  # ugniježđen u sourceInputPortDescriptor
                 cameras.append({
                     'id': cid,
                     'name': name if name else f'Kamera {cid}',
@@ -414,15 +465,12 @@ class NVRClient:
             try:
                 xml = self.get('Streaming/channels')
                 root = ET.fromstring(xml)
-                ns = {'h': 'http://www.hikvision.com/ver20/XMLSchema'}
-                chs = root.findall('.//h:StreamingChannel', ns)
-                if not chs:
-                    chs = root.findall('.//StreamingChannel')
+                chs = root.findall('.//{*}StreamingChannel')
                 for ch in chs:
-                    cid = find_text(ch, 'id', ns)
+                    cid = find_text(ch, 'id')
                     if cid and cid.endswith('01'):
                         base_id = cid[:-2] if len(cid) > 2 else cid
-                        name = find_text(ch, 'channelName', ns)
+                        name = find_text(ch, 'channelName')
                         cameras.append({'id': base_id, 'name': name if name else f'Kamera {base_id}', 'ip': '', 'status': 'online'})
             except: pass
         return cameras
@@ -441,42 +489,27 @@ class NVRClient:
         from datetime import timedelta
         track_id = self._track_id(channel)
 
-        ns10 = {'h': 'http://www.hikvision.com/ver10/XMLSchema'}
-        ns20 = {'h': 'http://www.hikvision.com/ver20/XMLSchema'}
-
-        def find_text(el, path, ns):
-            """Traži nested XML path s namespace prefiksom na svakom dijelu"""
-            # Primjer: 'timeSpan/startTime' → 'h:timeSpan/h:startTime'
-            ns_path = '/'.join(f'h:{p}' for p in path.split('/'))
-            found = el.find(ns_path, ns)
+        def find_text(el, path):
+            """Nested XML put po LOKALNIM imenima, neovisno o namespace-u.
+            'timeSpan/startTime' → '{*}timeSpan/{*}startTime' (matcha i hikvision.com
+            i OEM std-cgi.com namespace). Fallback na put bez namespacea."""
+            ns_path = '/'.join(f'{{*}}{p}' for p in path.split('/'))
+            found = el.find(ns_path)
             if found is None:
                 found = el.find(path)  # fallback bez namespacea
             return found.text.strip() if found is not None and found.text else ''
 
-        def detect_ns(root):
-            """Otkrij koji namespace koristi ovaj XML odgovor"""
-            if root.findall('.//h:matchList', ns20):
-                return ns20
-            if root.findall('.//h:matchList', ns10):
-                return ns10
-            return {}  # bez namespacea
-
         def parse_page(xml_resp):
             root = ET.fromstring(xml_resp)
-            ns = detect_ns(root)
-            items = (root.findall('.//h:matchList/h:searchMatchItem', ns) if ns
-                     else root.findall('.//matchList/searchMatchItem'))
-            # Fix: ne koristimo 'or' na XML elementu
-            status_el = root.find('h:responseStatusStrg', ns) if ns else None
-            if status_el is None:
-                status_el = root.find('responseStatusStrg')
+            items = root.findall('.//{*}matchList/{*}searchMatchItem')
+            status_el = root.find('.//{*}responseStatusStrg')
             status = status_el.text.strip() if status_el is not None and status_el.text else ''
             page_recs = []
             for item in items:
                 page_recs.append({
-                    'start': find_text(item, 'timeSpan/startTime', ns),
-                    'end':   find_text(item, 'timeSpan/endTime', ns),
-                    'uri':   find_text(item, 'mediaSegmentDescriptor/playbackURI', ns),
+                    'start': find_text(item, 'timeSpan/startTime'),
+                    'end':   find_text(item, 'timeSpan/endTime'),
+                    'uri':   find_text(item, 'mediaSegmentDescriptor/playbackURI'),
                 })
             return page_recs, status
 
@@ -622,6 +655,216 @@ class NVRClient:
                 f'{self.host}:{self.port}'
                 f'/ISAPI/ContentMgmt/download?playbackURI={encoded}')
 
+
+# ── ONVIF camera (any manufacturer) ─────────────────────────────────────────────
+class ONVIFClient:
+    """An ONVIF camera exposed through the same interface the UI and live-stream
+    path expect from NVRClient. ONVIF cameras deliver standard H.264/H.265 over
+    RTSP, which ffmpeg decodes cleanly — so live works via the RTSP path. No
+    Hikvision SDK, no NVR recordings (playback not applicable)."""
+    device_type = 'onvif'
+
+    def __init__(self, device_id=None, name='ONVIF Camera'):
+        self.device_id = device_id or str(id(self))
+        self.name      = name
+        self.host      = ''
+        self.port      = 80
+        self.username  = ''
+        self.password  = ''
+        self.xaddr     = None
+        self.timeout   = 8
+        # Compatibility with the NVRClient-based streaming path:
+        self.sdk_user_id = -1            # never uses the Hikvision SDK → RTSP path
+        self.start_dchan = 1
+        self.sdk_supports_download = True  # not an OEM-NVR → don't block live
+        self._lenses   = []              # [{'label','main','sub'}, …]
+        self.has_ptz   = False
+        self._ptz_token = ''
+        self.has_imaging = False
+        self._img_src  = 'V_SRC_000'     # video source token for imaging
+        self._cam      = None            # cached ONVIFCamera for PTZ/imaging
+        # user preferences (set via Manage dialog, persisted in config)
+        self.use_sub   = False           # stream quality: main (False) / sub (True)
+        self.audio_on  = False           # listen to microphone
+        self.extra_channels = []         # [{'name','url'}] user-added RTSP channels
+
+    def _client(self):
+        import onvif_client
+        return onvif_client.ONVIFCamera(self.host, self.port, self.username,
+                                        self.password, xaddr=self.xaddr)
+
+    def _fetch_streams(self):
+        """Resolve the camera's RTSP streams (main + sub) from ONVIF.
+
+        NOTE: some cameras (e.g. O-KAM) report 2 video sources but only expose
+        ONE on RTSP — the other lens is reachable only via their proprietary app.
+        Sibling RTSP channels (…/avN_M) on those turn out to be delayed aliases
+        of the same lens, so we DON'T auto-create extra cameras; the Manage dialog
+        offers an explicit channel scan instead."""
+        try:
+            streams = self._client().stream_urls()   # [(label,url) main, sub…]
+        except Exception as e:
+            print(f'[ONVIF] {self.host} stream fetch failed: {e}')
+            self._lenses = []
+            return
+        if not streams:
+            self._lenses = []
+            return
+        main0 = streams[0][1]
+        sub0  = streams[1][1] if len(streams) > 1 else main0
+        self._lenses = [{'label': '', 'main': main0, 'sub': sub0}]
+        # Append any extra RTSP channels the user picked via the channel scan.
+        for ec in self.extra_channels:
+            u = ec.get('url')
+            if u:
+                self._lenses.append({'label': ec.get('name', 'ch'),
+                                     'main': u, 'sub': u})
+
+    def test(self):
+        try:
+            cl = self._client()
+            info = cl.get_device_information()
+            self._fetch_streams()
+            if not self._lenses:
+                return False, 'No RTSP stream from ONVIF'
+            self._cam = cl
+            # Detect PTZ + imaging (day/night) support.
+            try:
+                pd = cl.get_profiles_detail()
+                if pd:
+                    self._ptz_token = pd[0]['token']
+                    self._img_src = pd[0]['source'] or 'V_SRC_000'
+                self.has_ptz = bool(cl.get_ptz_url())
+                self.has_imaging = bool(cl.get_imaging_url())
+            except Exception:
+                pass
+            extra = (' +PTZ' if self.has_ptz else '') + \
+                    (' +IR' if self.has_imaging else '')
+            return True, (info.get('model') or info.get('manufacturer') or 'OK') + extra
+        except Exception as e:
+            return False, str(e)
+
+    def _cam_inst(self):
+        if self._cam is None:
+            self._cam = self._client()
+        return self._cam
+
+    def ptz_move(self, pan=0.0, tilt=0.0, zoom=0.0):
+        """Pan/tilt/zoom the PTZ lens (velocities -1..1). Call ptz_stop() to halt."""
+        if not self.has_ptz:
+            return
+        try:
+            self._cam_inst().ptz(self._ptz_token, pan, tilt, zoom)
+        except Exception as e:
+            print(f'[PTZ] {self.host} move failed: {e}')
+
+    def ptz_stop(self):
+        self.ptz_move(0.0, 0.0, 0.0)
+
+    def set_day_night(self, mode):
+        """mode: 'AUTO' / 'ON' (day/colour) / 'OFF' (night/IR)."""
+        if not self.has_imaging:
+            return False
+        try:
+            return self._cam_inst().set_ir_cut_filter(self._img_src, mode)
+        except Exception as e:
+            print(f'[IMG] {self.host} day/night failed: {e}')
+            return False
+
+    def get_day_night(self):
+        if not self.has_imaging:
+            return None
+        try:
+            return self._cam_inst().get_ir_cut_filter(self._img_src)
+        except Exception:
+            return None
+
+    def get_cameras(self):
+        if not self._lenses:
+            self._fetch_streams()
+        if len(self._lenses) <= 1:
+            return [{'id': '1', 'name': self.name, 'ip': self.host, 'status': 'online'}]
+        cams = []
+        for i, L in enumerate(self._lenses):
+            nm = self.name if i == 0 else f'{self.name} [{L["label"] or "ch" + str(i)}]'
+            cams.append({'id': str(i + 1), 'name': nm,
+                         'ip': self.host, 'status': 'online'})
+        return cams
+
+    def rtsp_live_url(self, channel_id, sub=False):
+        # Each channel_id maps to one lens; sub selects its sub-stream.
+        sub = sub or self.use_sub          # per-camera quality preference
+        if not self._lenses:
+            self._fetch_streams()
+        if not self._lenses:
+            return ''
+        idx = max(0, min(int(channel_id) - 1, len(self._lenses) - 1))
+        L = self._lenses[idx]
+        return L['sub'] if sub else L['main']
+
+    # No-op SDK shims so the shared streaming code can call them uniformly.
+    def sdk_login(self):  return False
+    def sdk_logout(self): pass
+    def sdk_channel(self, channel_num): return int(channel_num)
+
+    # ONVIF cameras have no NVR recordings (Replay service not implemented).
+    def get_recordings(self, channel, date): return []
+
+    def to_dict(self):
+        return {'id': self.device_id, 'name': self.name, 'host': self.host,
+                'port': self.port, 'username': self.username,
+                'password': self.password, 'type': 'onvif', 'xaddr': self.xaddr,
+                'use_sub': self.use_sub, 'extra_channels': self.extra_channels}
+
+
+# ── Manual RTSP camera ───────────────────────────────────────────────────────────
+class ManualRTSPClient:
+    """A camera defined by a raw RTSP URL the user types in. Streams via the same
+    RTSP path as everything else. For any camera/stream the scanner can't find."""
+    device_type = 'rtsp'
+
+    def __init__(self, device_id=None, name='RTSP Camera'):
+        self.device_id = device_id or str(id(self))
+        self.name      = name
+        self.url       = ''
+        self.host      = ''
+        self.port      = 554
+        self.username  = ''
+        self.password  = ''
+        self.sdk_user_id = -1
+        self.start_dchan = 1
+        self.sdk_supports_download = True
+
+    def _host_from_url(self):
+        from urllib.parse import urlparse
+        try:
+            return urlparse(self.url).hostname or ''
+        except Exception:
+            return ''
+
+    def test(self):
+        if not self.url.strip():
+            return False, 'No RTSP URL'
+        self.host = self._host_from_url() or self.host
+        return True, 'OK'
+
+    def get_cameras(self):
+        return [{'id': '1', 'name': self.name,
+                 'ip': self._host_from_url(), 'status': 'online'}]
+
+    def rtsp_live_url(self, channel_id, sub=False):
+        return self.url
+
+    def sdk_login(self):  return False
+    def sdk_logout(self): pass
+    def sdk_channel(self, channel_num): return int(channel_num)
+    def get_recordings(self, channel, date): return []
+
+    def to_dict(self):
+        return {'id': self.device_id, 'name': self.name, 'host': self.host,
+                'port': self.port, 'type': 'rtsp', 'url': self.url}
+
+
 # ── Video Worker Thread ────────────────────────────────────────────────────────
 def _sniff_codec(data: bytes):
     """
@@ -756,10 +999,14 @@ class VideoWorker(QThread):
 
     def _build_proc_rtsp(self, frame_bytes):
         import subprocess as sp
+        # NOTE: '-fflags nobuffer -flags low_delay' + small probe (1M) starve the
+        # demuxer on some OEM/Safire H.264/H.265 streams — ffmpeg gives up before
+        # the first keyframe + SPS/PPS arrive and never emits a frame ("connecting"
+        # forever). Larger probe/analyze (5M) and dropping the low-delay flags let
+        # it sync reliably. Costs a little startup latency, gains decodability.
         cmd = self._ffmpeg_base(
-            ['-rtsp_transport', 'tcp', '-fflags', 'nobuffer',
-             '-flags', 'low_delay', '-analyzeduration', '1000000',
-             '-probesize', '1000000'],
+            ['-rtsp_transport', 'tcp',
+             '-analyzeduration', '5000000', '-probesize', '5000000'],
             self.rtsp_url)
         return sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, bufsize=frame_bytes)
 
@@ -1311,8 +1558,15 @@ class VideoWorker(QThread):
         #              a green/garbled image due to NV12 layout mismatch)
         if self.sdk_source is not None and _SDK:
             mode = self.sdk_source.get('mode', 'playback')
+            nvr  = self.sdk_source.get('nvr')
             if mode == 'playback':
-                self._run_download_play()
+                # Genuine Hikvision: download-to-file path (supports in-file seek).
+                # OEM rebrands (Safire) reject the SDK download API → their file
+                # stays empty ("Buffering timed out"); stream via PlayM4 instead.
+                if _PLAYM4_OK and nvr is not None and not getattr(nvr, 'sdk_supports_download', True):
+                    self._run_playm4()
+                else:
+                    self._run_download_play()
                 return
             if _PLAYM4_OK:
                 self._run_playm4()
@@ -1392,6 +1646,223 @@ class VideoWorker(QThread):
             except: pass
 
 # ── Fullscreen prozor ─────────────────────────────────────────────────────────
+class ZoomableVideoLabel(QLabel):
+    """A QLabel replacement for video display that supports mouse-wheel zoom
+    (centred on the cursor) and click-drag panning. Call set_frame(QImage)
+    each frame instead of setPixmap(). When zoom == 1.0 it behaves like the
+    old label (full frame, KeepAspectRatio, centred)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._img = None          # current QImage (full-res decoded frame)
+        self._zoom = 1.0          # 1.0 = fit, >1 = zoomed in
+        self._min_zoom = 1.0
+        self._max_zoom = 8.0
+        # Pan offset in *image* pixels: the image-space point shown at widget
+        # centre. Starts at image centre.
+        self._cx = 0.5            # normalized 0..1 focus point (x)
+        self._cy = 0.5            # normalized 0..1 focus point (y)
+        self._panning = False
+        self._pan_last = QPoint()
+        # When True (grid cells), clicks/double-clicks are forwarded to the
+        # parent so single-click-select and double-click-fullscreen still work;
+        # panning only engages once zoomed in.
+        self._forward_clicks = False
+        self.setMouseTracking(True)
+
+    def set_forward_clicks(self, on):
+        self._forward_clicks = on
+
+    # -- public API ---------------------------------------------------------
+    def set_frame(self, qimg: QImage):
+        """Supply a new video frame (full resolution)."""
+        self._img = qimg
+        self.update()
+
+    def clear_frame(self):
+        self._img = None
+        self.reset_zoom()
+        self.update()
+
+    def reset_zoom(self):
+        self._zoom = 1.0
+        self._cx = 0.5
+        self._cy = 0.5
+        self.update()
+
+    def has_zoom(self):
+        return self._zoom > 1.001
+
+    # -- zoom / pan input ---------------------------------------------------
+    def wheelEvent(self, e):
+        if self._img is None:
+            return
+        delta = e.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.25 if delta > 0 else 1 / 1.25
+        old_zoom = self._zoom
+        new_zoom = max(self._min_zoom, min(self._max_zoom, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+
+        # Zoom centred on cursor: keep the image point under the cursor fixed.
+        # Compute image-space point under cursor at old zoom, then set focus so
+        # it stays under the cursor at the new zoom.
+        ip = self._widget_to_img(e.pos(), old_zoom)
+        if ip is not None:
+            iw = self._img.width()
+            ih = self._img.height()
+            # Where is the cursor within the widget, normalized -0.5..0.5
+            disp = self._display_rect(old_zoom)
+            if disp.width() > 0 and disp.height() > 0:
+                self._zoom = new_zoom
+                # New focus so that image point ip maps back under the cursor
+                cur = e.pos()
+                disp2 = self._display_rect(new_zoom)
+                # fraction of cursor across the *visible* viewport
+                fx = (cur.x() - self.width() / 2) / self.width()
+                fy = (cur.y() - self.height() / 2) / self.height()
+                # visible span in normalized image coords at new zoom
+                vis_w = self._visible_frac_w(new_zoom)
+                vis_h = self._visible_frac_h(new_zoom)
+                self._cx = ip[0] / iw - fx * vis_w
+                self._cy = ip[1] / ih - fy * vis_h
+                self._clamp_focus(new_zoom)
+        else:
+            self._zoom = new_zoom
+            self._clamp_focus(new_zoom)
+
+        if self._zoom <= 1.001:
+            self.reset_zoom()
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.has_zoom():
+            self._panning = True
+            self._pan_last = e.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self._forward_clicks:
+            e.ignore()            # let the parent VideoCell handle selection
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._img is not None:
+            dx = e.pos().x() - self._pan_last.x()
+            dy = e.pos().y() - self._pan_last.y()
+            self._pan_last = e.pos()
+            # Convert pixel drag to normalized focus shift (inverted: drag right
+            # moves image right => focus moves left).
+            self._cx -= dx / self.width() * self._visible_frac_w(self._zoom)
+            self._cy -= dy / self.height() * self._visible_frac_h(self._zoom)
+            self._clamp_focus(self._zoom)
+            self.update()
+        else:
+            super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._panning:
+            self._panning = False
+            self.setCursor(Qt.OpenHandCursor if self.has_zoom() else Qt.ArrowCursor)
+        elif self._forward_clicks:
+            e.ignore()
+        else:
+            super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        # In grid mode, double-click belongs to the cell (fullscreen), not zoom.
+        if self._forward_clicks:
+            e.ignore()
+            return
+        # Standalone (fullscreen/playback): double-click resets zoom.
+        if self.has_zoom():
+            self.reset_zoom()
+            self.setCursor(Qt.ArrowCursor)
+        else:
+            super().mouseDoubleClickEvent(e)
+
+    # -- geometry helpers ---------------------------------------------------
+    def _visible_frac_w(self, zoom):
+        return 1.0 / zoom
+
+    def _visible_frac_h(self, zoom):
+        return 1.0 / zoom
+
+    def _clamp_focus(self, zoom):
+        half_w = self._visible_frac_w(zoom) / 2
+        half_h = self._visible_frac_h(zoom) / 2
+        self._cx = max(half_w, min(1 - half_w, self._cx))
+        self._cy = max(half_h, min(1 - half_h, self._cy))
+
+    def _display_rect(self, zoom):
+        """The rect (in widget coords) where the full frame would be drawn at
+        zoom=1 with KeepAspectRatio (letterboxed)."""
+        if self._img is None:
+            return QRectF()
+        iw, ih = self._img.width(), self._img.height()
+        ww, wh = self.width(), self.height()
+        if iw == 0 or ih == 0:
+            return QRectF()
+        scale = min(ww / iw, wh / ih)
+        dw, dh = iw * scale, ih * scale
+        x = (ww - dw) / 2
+        y = (wh - dh) / 2
+        return QRectF(x, y, dw, dh)
+
+    def _widget_to_img(self, pos, zoom):
+        """Map a widget-space point to image-space pixels at the given zoom."""
+        if self._img is None:
+            return None
+        iw, ih = self._img.width(), self._img.height()
+        vis_w = self._visible_frac_w(zoom)
+        vis_h = self._visible_frac_h(zoom)
+        # Source rect (in normalized image coords) currently shown:
+        sx0 = self._cx - vis_w / 2
+        sy0 = self._cy - vis_h / 2
+        fx = pos.x() / self.width()
+        fy = pos.y() / self.height()
+        nx = sx0 + fx * vis_w
+        ny = sy0 + fy * vis_h
+        return (nx * iw, ny * ih)
+
+    # -- rendering ----------------------------------------------------------
+    def paintEvent(self, e):
+        if self._img is None:
+            super().paintEvent(e)   # show text placeholder etc.
+            return
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        iw, ih = self._img.width(), self._img.height()
+        if iw == 0 or ih == 0:
+            return
+
+        if self._zoom <= 1.001:
+            # Fit whole frame, KeepAspectRatio, centred (old behaviour).
+            target = self._display_rect(1.0)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawImage(target, self._img, QRectF(0, 0, iw, ih))
+        else:
+            # Show a sub-region of the image scaled to fill the widget.
+            vis_w = self._visible_frac_w(self._zoom)
+            vis_h = self._visible_frac_h(self._zoom)
+            sx = (self._cx - vis_w / 2) * iw
+            sy = (self._cy - vis_h / 2) * ih
+            sw = vis_w * iw
+            sh = vis_h * ih
+            src = QRectF(sx, sy, sw, sh)
+            # Keep aspect ratio inside the widget (letterbox if needed).
+            target = self._display_rect(1.0)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawImage(target, self._img, src)
+
+            # Small zoom indicator in the corner.
+            p.setPen(QColor(255, 255, 255, 200))
+            f = p.font(); f.setPixelSize(11); p.setFont(f)
+            p.fillRect(6, 6, 54, 18, QColor(0, 0, 0, 140))
+            p.drawText(10, 19, f'{self._zoom:.1f}×')
+
+
 class FullscreenWindow(QWidget):
     def __init__(self, channel_id, name, nvr, parent=None):
         super().__init__(parent)
@@ -1402,7 +1873,7 @@ class FullscreenWindow(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.label = QLabel(f'⏳ Connecting {name}...')
+        self.label = ZoomableVideoLabel(f'⏳ Connecting {name}...')
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet('color: #555; font-size: 14px;')
         lay.addWidget(self.label)
@@ -1417,10 +1888,7 @@ class FullscreenWindow(QWidget):
     def _on_frame(self, _, qi):
         if self.worker:
             self.worker.notify_displayed()
-        pm = QPixmap.fromImage(qi).scaled(
-            self.label.width(), self.label.height(),
-            Qt.KeepAspectRatio, Qt.FastTransformation)
-        self.label.setPixmap(pm)
+        self.label.set_frame(qi)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Escape, Qt.Key_F, Qt.Key_Q):
@@ -1454,12 +1922,13 @@ class VideoCell(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Video label
-        self.video_label = QLabel()
+        # Video label (zoomable)
+        self.video_label = ZoomableVideoLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet('border: none; background: transparent;')
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.video_label.setScaledContents(False)
+        self.video_label.set_forward_clicks(True)  # grid: click selects, dbl=fullscreen
         lay.addWidget(self.video_label)
 
         # Placeholder
@@ -1514,9 +1983,22 @@ class VideoCell(QFrame):
                 dlog('CELL', f'{self.name}: already streaming, skip start')
                 return
 
+        # OEM rebrands (Safire/Sapphire by Hik) emit a non-standard LIVE stream
+        # (H.264 profile 53 / H.265+) that no available decoder — ffmpeg, VLC,
+        # GStreamer, even Hikvision's own PlayM4 — can render. Rather than a green/
+        # garbled image or an endless "Connecting…", say so plainly. Their
+        # RECORDINGS are standard, so Playback works fine.
+        if getattr(self.nvr, 'sdk_supports_download', True) is False:
+            self._streaming = False
+            self.video_label.hide()
+            self.placeholder.setText('ℹ️\nLive nije podržan za ovaj uređaj\n(koristi Playback)')
+            self.placeholder.show()
+            self.status_dot.setStyleSheet(f'color: {DARK["dim"]}; font-size: 10px; border: none;')
+            return
+
         # Clear any stale frame from a previous camera so we don't show its last
         # image while the new stream spins up.
-        self.video_label.setPixmap(QPixmap())
+        self.video_label.clear_frame()
         self.video_label.hide()
         self.placeholder.show()
 
@@ -1531,7 +2013,12 @@ class VideoCell(QFrame):
             dw, dh = 1280, 720
 
         # Prefer SDK + PlayM4 native decode (no ffmpeg, no RTSP bandwidth limit).
-        if _PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0:
+        # ONLY for genuine Hikvision (sdk_supports_download). OEM rebrands (Safire)
+        # emit a non-standard live stream (H.264 profile 53) that PlayM4 cannot
+        # decode → it would feed data but yield 0 frames ("connecting" forever).
+        # Those fall through to the RTSP path instead.
+        if (_PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0
+                and getattr(self.nvr, 'sdk_supports_download', True)):
             dlog('Live', f'SDK {"sub" if sub else "main"} {self.name}  '
                   f'ch={self.real_channel}  decode={dw}x{dh}')
             self.worker = VideoWorker(
@@ -1576,11 +2063,7 @@ class VideoCell(QFrame):
             self.worker.notify_displayed()
         if not self._streaming:
             return
-        pm = QPixmap.fromImage(qi).scaled(
-            self.video_label.width(), self.video_label.height(),
-            Qt.KeepAspectRatio, Qt.FastTransformation
-        )
-        self.video_label.setPixmap(pm)
+        self.video_label.set_frame(qi)
         if not self.video_label.isVisible():
             self.placeholder.hide()
             self.video_label.show()
@@ -1631,10 +2114,14 @@ class LiveViewTab(QWidget):
         self.grid_combo.setFixedWidth(110)
         self.grid_combo.currentIndexChanged.connect(self._on_grid_changed)
 
+        self.ptz_box = self._build_ptz_controls()
+        self.ptz_box.setVisible(False)
+
         toolbar.addWidget(self.btn_all)
         toolbar.addWidget(self.btn_stop)
         toolbar.addWidget(self.lbl_quality)
         toolbar.addStretch()
+        toolbar.addWidget(self.ptz_box)
         toolbar.addWidget(QLabel('Layout:'))
         toolbar.addWidget(self.grid_combo)
         lay.addLayout(toolbar)
@@ -1647,6 +2134,41 @@ class LiveViewTab(QWidget):
         self.grid_layout = QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(6)
         lay.addWidget(self.grid_widget)
+
+    def _build_ptz_controls(self):
+        """Compact PTZ d-pad — shown only when the selected camera supports PTZ.
+        Hold a button to move, release to stop (ONVIF ContinuousMove/Stop)."""
+        from PyQt5.QtWidgets import QGridLayout
+        w = QWidget()
+        g = QGridLayout(w); g.setContentsMargins(0, 0, 0, 0); g.setSpacing(1)
+        lbl = QLabel('PTZ '); lbl.setStyleSheet(f'color:{DARK["dim"]};font-size:10px;')
+        g.addWidget(lbl, 1, 0)
+
+        def mk(text, pan, tilt, zoom, tip):
+            b = QPushButton(text); b.setFixedSize(26, 20); b.setToolTip(tip)
+            b.pressed.connect(lambda: self._ptz(pan, tilt, zoom))
+            b.released.connect(self._ptz_stop)
+            return b
+        # Cross d-pad: up / left·right / down, then zoom out/in.
+        g.addWidget(mk('↑', 0,  0.6, 0, 'Tilt up'),    0, 2)
+        g.addWidget(mk('←', -0.6, 0, 0, 'Pan left'),   1, 1)
+        g.addWidget(mk('→', 0.6,  0, 0, 'Pan right'),  1, 3)
+        g.addWidget(mk('↓', 0, -0.6, 0, 'Tilt down'),  2, 2)
+        zl = QLabel(' Zoom'); zl.setStyleSheet(f'color:{DARK["dim"]};font-size:10px;')
+        g.addWidget(zl, 1, 4)
+        g.addWidget(mk('–', 0, 0, -0.6, 'Zoom out'),   1, 5)
+        g.addWidget(mk('+', 0, 0,  0.6, 'Zoom in'),    1, 6)
+        return w
+
+    def _ptz(self, pan, tilt, zoom):
+        nvr = self.nvr
+        if nvr is not None and getattr(nvr, 'has_ptz', False):
+            nvr.ptz_move(pan, tilt, zoom)
+
+    def _ptz_stop(self):
+        nvr = self.nvr
+        if nvr is not None and getattr(nvr, 'has_ptz', False):
+            nvr.ptz_stop()
 
     def set_cameras(self, cameras):
         self.cameras = cameras
@@ -1670,6 +2192,7 @@ class LiveViewTab(QWidget):
         (overlap). This makes switching feel instant."""
         old_id = getattr(self, 'selected_cam_id', None)
         self.selected_cam_id = channel_id
+        self.ptz_box.setVisible(bool(getattr(self.nvr, 'has_ptz', False)))
 
         if self.grid_combo.currentIndex() == 0:
             self.relayout(0)
@@ -2108,7 +2631,7 @@ class PlaybackTab(QWidget):
         right = QVBoxLayout()
         right.setSpacing(8)
 
-        self.video_label = QLabel('Select a recording to play')
+        self.video_label = ZoomableVideoLabel('Select a recording to play')
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet(
             f'background:{DARK["panel"]};border:1px solid {DARK["border"]};'
@@ -2319,6 +2842,7 @@ class PlaybackTab(QWidget):
         # Stop any existing playback (non-blocking — runs in background thread)
         self.stop_playback()
 
+        self.video_label.clear_frame()
         self.video_label.setText('Loading...')
         self._paused = False
 
@@ -2403,18 +2927,7 @@ class PlaybackTab(QWidget):
     def _on_frame(self, _, qi):
         if self.worker:
             self.worker.notify_displayed()
-        # Cache the label size and only refresh it occasionally. Scaling to
-        # label.width()/height() every frame can trigger a layout recompute →
-        # the Expanding label resizes → next frame scales to a new size → another
-        # relayout… a feedback loop that pegs the GUI thread. Using a stable
-        # cached size breaks the loop.
-        sz = self.video_label.size()
-        self._lbl_w = sz.width()
-        self._lbl_h = sz.height()
-        pm = QPixmap.fromImage(qi).scaled(
-            self._lbl_w, self._lbl_h,
-            Qt.KeepAspectRatio, Qt.FastTransformation)
-        self.video_label.setPixmap(pm)
+        self.video_label.set_frame(qi)
 
     def _on_pb_error(self, _, msg):
         self.timer.stop()
@@ -2539,9 +3052,297 @@ class PlaybackTab(QWidget):
         self.prog_slider.setValue(0)
         self.pos_label.setText('00:00')
         self.video_label.setText('Select a recording to play')
-        self.video_label.setPixmap(QPixmap())
+        self.video_label.clear_frame()
 
 # ── Device Add/Edit Dialog ────────────────────────────────────────────────────
+class AudioPlayer:
+    """Plays one camera's microphone audio via ffplay (handles its own RTSP
+    connection + audio sink). Only one camera at a time."""
+    def __init__(self):
+        self._proc = None
+        self.current = None     # the nvr currently playing
+
+    def play(self, url, nvr=None):
+        self.stop()
+        if not url:
+            return
+        import subprocess as sp
+        try:
+            self._proc = sp.Popen(
+                ['ffplay', '-loglevel', 'quiet', '-nodisp', '-vn', '-autoexit',
+                 '-rtsp_transport', 'tcp', '-fflags', 'nobuffer', '-i', url],
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL, stdin=sp.DEVNULL)
+            self.current = nvr
+        except FileNotFoundError:
+            print('[Audio] ffplay not found')
+            self._proc = None
+
+    def stop(self):
+        if self._proc:
+            try: self._proc.terminate()
+            except Exception: pass
+            self._proc = None
+        self.current = None
+
+    def is_playing(self, nvr):
+        return self._proc is not None and self._proc.poll() is None and self.current is nvr
+
+
+class ChannelScanDialog(QWidget):
+    """Scans the camera's RTSP channels, shows a live thumbnail of each, and lets
+    the user pick which to add as separate cameras. The user decides what to keep —
+    we don't hide anything (works for any camera, not just this one)."""
+    _found = pyqtSignal(str, str, str)   # label, url, thumb_path
+    _done  = pyqtSignal(int)
+
+    def __init__(self, nvr, main, parent=None):
+        super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.nvr = nvr; self.main = main
+        self.setWindowTitle(f'Channels — {nvr.name}')
+        self.setMinimumSize(440, 460)
+        lay = QVBoxLayout(self)
+        self.info = QLabel('Scanning channels — preview each and tick the ones to add…')
+        self.info.setWordWrap(True); lay.addWidget(self.info)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        inner = QWidget(); self.vbox = QVBoxLayout(inner); self.vbox.addStretch()
+        self.scroll.setWidget(inner); lay.addWidget(self.scroll)
+        self._rows = []
+        row = QHBoxLayout()
+        self.b_add = QPushButton('Add selected')
+        self.b_add.setStyleSheet(f'background:{DARK["accent"]};color:white;font-weight:600;padding:6px;')
+        self.b_add.clicked.connect(self._add)
+        close = QPushButton('Close'); close.clicked.connect(self.close)
+        row.addWidget(self.b_add); row.addWidget(close); lay.addLayout(row)
+        self._found.connect(self._on_found)
+        self._done.connect(self._on_done)
+        threading.Thread(target=self._scan, daemon=True).start()
+
+    def _candidates(self):
+        import re
+        base = self.nvr.rtsp_live_url('1', sub=False)
+        if re.search(r'av(\d+)_(\d+)', base):
+            return [(f'av{i}', re.sub(r'av\d+_(\d+)', rf'av{i}_\1', base)) for i in range(8)]
+        if re.search(r'channel=(\d+)', base):
+            return [(f'ch{i}', re.sub(r'channel=\d+', f'channel={i}', base)) for i in range(8)]
+        return [('main', base)]
+
+    def _scan(self):
+        import subprocess as sp, tempfile, os
+        n = 0
+        for label, url in self._candidates():
+            thumb = os.path.join(tempfile.gettempdir(), f'hikscan_{label}.png')
+            try:
+                sp.run(['ffmpeg', '-loglevel', 'quiet', '-rtsp_transport', 'tcp',
+                        '-analyzeduration', '3000000', '-probesize', '3000000',
+                        '-i', url, '-frames:v', '1', '-vf', 'scale=240:135',
+                        '-y', thumb], timeout=12, stdin=sp.DEVNULL,
+                       stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                if os.path.exists(thumb) and os.path.getsize(thumb) > 0:
+                    self._found.emit(label, url, thumb); n += 1
+            except Exception:
+                pass
+        self._done.emit(n)
+
+    def _on_found(self, label, url, thumb):
+        from PyQt5.QtWidgets import QCheckBox
+        from PyQt5.QtGui import QPixmap
+        w = QWidget(); r = QHBoxLayout(w); r.setContentsMargins(2, 2, 2, 2)
+        cb = QCheckBox()
+        pic = QLabel(); pm = QPixmap(thumb)
+        if not pm.isNull():
+            pic.setPixmap(pm)
+        txt = QLabel(label)
+        r.addWidget(cb); r.addWidget(pic); r.addWidget(txt); r.addStretch()
+        self.vbox.insertWidget(self.vbox.count() - 1, w)
+        self._rows.append((cb, label, url))
+
+    def _on_done(self, n):
+        self.info.setText(f'Found {n} channel(s). Tick the ones to add, then "Add selected".'
+                          if n else 'No channels responded.')
+
+    def _add(self):
+        sel = [{'name': label, 'url': url} for cb, label, url in self._rows if cb.isChecked()]
+        if sel:
+            self.main._add_onvif_channels(self.nvr, sel)
+        self.close()
+
+
+class ManageCameraDialog(QWidget):
+    """Per-camera options for ONVIF/RTSP cameras: stream quality, audio (mic),
+    day/night (IR), PTZ note, and an explicit extra-channel scan."""
+    _scan_done = pyqtSignal(str)
+
+    def __init__(self, nvr, main, parent=None):
+        super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.nvr = nvr; self.main = main
+        self.setWindowTitle(f'Manage — {nvr.name}')
+        self.setFixedWidth(380)
+        lay = QVBoxLayout(self)
+
+        lay.addWidget(QLabel('Stream quality:'))
+        row = QHBoxLayout()
+        self.q_main = QPushButton('Main (HD)'); self.q_sub = QPushButton('Sub (low)')
+        for b in (self.q_main, self.q_sub):
+            b.setCheckable(True)
+        sub = getattr(nvr, 'use_sub', False)
+        self.q_main.setChecked(not sub); self.q_sub.setChecked(sub)
+        self.q_main.clicked.connect(lambda: self._quality(False))
+        self.q_sub.clicked.connect(lambda: self._quality(True))
+        row.addWidget(self.q_main); row.addWidget(self.q_sub)
+        lay.addLayout(row)
+
+        self.b_audio = QPushButton('🔊  Listen to microphone')
+        self.b_audio.setCheckable(True)
+        self.b_audio.setChecked(main.audio.is_playing(nvr))
+        self.b_audio.clicked.connect(self._audio)
+        lay.addWidget(self.b_audio)
+
+        if getattr(nvr, 'has_imaging', False):
+            lay.addWidget(QLabel('Day / Night (IR):'))
+            r2 = QHBoxLayout()
+            for label, mode in [('Auto', 'AUTO'), ('Day', 'ON'), ('Night', 'OFF')]:
+                bb = QPushButton(label)
+                bb.clicked.connect(lambda _, m=mode: self._daynight(m))
+                r2.addWidget(bb)
+            lay.addLayout(r2)
+
+        if getattr(nvr, 'has_ptz', False):
+            n = QLabel('PTZ: arrow pad appears in the live toolbar when selected.')
+            n.setStyleSheet(f'color:{DARK["dim"]};font-size:11px;')
+            n.setWordWrap(True); lay.addWidget(n)
+
+        self.b_scan = QPushButton('Scan extra channels…')
+        self.b_scan.clicked.connect(self._scan)
+        lay.addWidget(self.b_scan)
+        self.lbl_msg = QLabel(''); self.lbl_msg.setWordWrap(True)
+        self.lbl_msg.setStyleSheet(f'color:{DARK["dim"]};font-size:11px;')
+        lay.addWidget(self.lbl_msg)
+        self._scan_done.connect(self.lbl_msg.setText)
+
+        close = QPushButton('Close'); close.clicked.connect(self.close)
+        lay.addWidget(close)
+
+    def _quality(self, sub):
+        self.nvr.use_sub = sub
+        self.q_main.setChecked(not sub); self.q_sub.setChecked(sub)
+        NVRClient.save_all(self.main.devices)
+        self.main._restart_nvr_streams(self.nvr)
+        self.lbl_msg.setText('Stream quality: ' + ('Sub' if sub else 'Main'))
+
+    def _audio(self):
+        self.main._set_audio(self.nvr, self.b_audio.isChecked())
+
+    def _daynight(self, mode):
+        self.lbl_msg.setText(f'Setting day/night → {mode}…')
+        def run():
+            ok = self.nvr.set_day_night(mode)
+            self._scan_done.emit('Day/Night → ' + (mode if ok else 'failed'))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _scan(self):
+        dlg = ChannelScanDialog(self.nvr, self.main, self.main)
+        dlg.show()
+
+
+class ONVIFScanDialog(QWidget):
+    """Lists ONVIF cameras found on the LAN and adds the selected ones."""
+    add_cameras = pyqtSignal(list)   # [{host, port, xaddr, name, username, password}]
+
+    def __init__(self, devs, parent=None):
+        super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setWindowTitle('ONVIF cameras on network')
+        self.setMinimumWidth(420)
+        self._devs = devs
+        lay = QVBoxLayout(self)
+        if not devs:
+            lay.addWidget(QLabel('No new ONVIF cameras found.\n'
+                                 'Make sure you are on the same network as the camera.'))
+            close = QPushButton('Close'); close.clicked.connect(self.close)
+            lay.addWidget(close)
+            return
+        lay.addWidget(QLabel(f'Found {len(devs)} camera(s). Select to add:'))
+        self._checks = []
+        for d in devs:
+            from PyQt5.QtWidgets import QCheckBox
+            cb = QCheckBox(f"{d['host']}  (port {d['port']})")
+            cb.setChecked(True)
+            lay.addWidget(cb)
+            self._checks.append((cb, d))
+        lay.addWidget(QLabel('Credentials (leave blank if camera needs none):'))
+        cred = QHBoxLayout()
+        self.f_user = QLineEdit('admin'); self.f_user.setPlaceholderText('username')
+        self.f_pass = QLineEdit(); self.f_pass.setEchoMode(QLineEdit.Password)
+        self.f_pass.setPlaceholderText('password')
+        cred.addWidget(self.f_user); cred.addWidget(self.f_pass)
+        lay.addLayout(cred)
+        btns = QHBoxLayout()
+        add = QPushButton('Add selected'); add.setStyleSheet(
+            f'background:{DARK["accent"]};color:white;font-weight:600;padding:6px;')
+        add.clicked.connect(self._add)
+        cancel = QPushButton('Cancel'); cancel.clicked.connect(self.close)
+        btns.addWidget(add); btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+    def _add(self):
+        u = self.f_user.text().strip(); p = self.f_pass.text()
+        out = []
+        for cb, d in self._checks:
+            if cb.isChecked():
+                out.append({'host': d['host'], 'port': d['port'],
+                            'xaddr': d.get('xaddr'),
+                            'name': f"ONVIF {d['host'].split('.')[-1]}",
+                            'username': u, 'password': p})
+        if out:
+            self.add_cameras.emit(out)
+        self.close()
+
+
+class ManualRTSPDialog(QWidget):
+    """Add a camera by typing its RTSP URL directly."""
+    saved = pyqtSignal(object)   # emits ManualRTSPClient
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setWindowTitle('Add RTSP camera')
+        self.setFixedWidth(440)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('Name:'))
+        self.f_name = QLineEdit('RTSP Camera')
+        lay.addWidget(self.f_name)
+        lay.addWidget(QLabel('RTSP URL:'))
+        self.f_url = QLineEdit()
+        self.f_url.setPlaceholderText('rtsp://user:pass@192.168.1.50:554/stream')
+        lay.addWidget(self.f_url)
+        hint = QLabel('Tip: include credentials in the URL if the camera needs them.')
+        hint.setStyleSheet(f'color:{DARK["dim"]};font-size:11px;')
+        lay.addWidget(hint)
+        row = QHBoxLayout()
+        save = QPushButton('Save')
+        save.setStyleSheet(f'background:{DARK["accent"]};color:white;font-weight:600;padding:6px;')
+        save.clicked.connect(self._save)
+        cancel = QPushButton('Cancel'); cancel.clicked.connect(self.close)
+        row.addWidget(save); row.addWidget(cancel)
+        lay.addLayout(row)
+
+    def _save(self):
+        import uuid
+        from urllib.parse import urlparse
+        url = self.f_url.text().strip()
+        if not url:
+            return
+        c = ManualRTSPClient(str(uuid.uuid4()),
+                             self.f_name.text().strip() or 'RTSP Camera')
+        c.url = url
+        try:
+            p = urlparse(url)
+            c.host = p.hostname or ''
+            c.port = p.port or 554
+        except Exception:
+            pass
+        self.saved.emit(c)
+        self.close()
+
+
 class DeviceDialog(QWidget):
     """Floating panel to add or edit an NVR device"""
     saved = pyqtSignal(object)   # emits NVRClient
@@ -2618,10 +3419,13 @@ class DeviceDialog(QWidget):
 # ── Main Window ────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     _cameras_ready = pyqtSignal(object, list)   # nvr, cameras — for thread-safe UI update
+    _onvif_found   = pyqtSignal(list)           # discovered ONVIF devices
 
     def __init__(self):
         super().__init__()
         self._cameras_ready.connect(self._on_cameras_ready)
+        self._onvif_found.connect(self._on_onvif_found)
+        self.audio = AudioPlayer()
         self.setWindowTitle('Hikvision Monitor')
         self.setMinimumSize(1280, 720)
         self.resize(1500, 900)
@@ -2657,10 +3461,9 @@ class MainWindow(QMainWindow):
         dev_hdr = QHBoxLayout()
         dev_lbl = QLabel('DEVICES')
         dev_lbl.setStyleSheet(f'color:{DARK["dim"]};font-size:10px;letter-spacing:2px;')
-        btn_add_dev = QPushButton('+')
-        btn_add_dev.setFixedSize(22,22)
-        btn_add_dev.setToolTip('Add NVR')
-        btn_add_dev.clicked.connect(self._add_device)
+        btn_add_dev = QPushButton('+ Add')
+        btn_add_dev.setToolTip('Add a camera or NVR')
+        btn_add_dev.clicked.connect(self._show_add_menu)
         dev_hdr.addWidget(dev_lbl)
         dev_hdr.addStretch()
         dev_hdr.addWidget(btn_add_dev)
@@ -2685,6 +3488,8 @@ class MainWindow(QMainWindow):
         self.cam_list = CameraListWidget()
         self.cam_list.itemClicked.connect(self._cam_clicked)
         self.cam_list.itemDoubleClicked.connect(self._cam_dbl_clicked)
+        self.cam_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.cam_list.customContextMenuRequested.connect(self._camera_context_menu)
         sb.addWidget(self.cam_list)
         sb.setStretch(sb.count()-1, 1)
 
@@ -2719,10 +3524,33 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, d.device_id)
             self.dev_list.addItem(item)
 
+    def _show_add_menu(self):
+        from PyQt5.QtWidgets import QMenu
+        m = QMenu(self)
+        m.setStyleSheet(f'background:{DARK["panel"]};color:{DARK["text"]};'
+                        f'border:1px solid {DARK["border"]};')
+        a_nvr   = m.addAction('NVR  (Hikvision / Safire)…')
+        a_onvif = m.addAction('Scan ONVIF network…')
+        a_rtsp  = m.addAction('Manual RTSP URL…')
+        btn = self.sender()
+        pos = btn.mapToGlobal(btn.rect().bottomLeft()) if btn else self.cursor().pos()
+        act = m.exec_(pos)
+        if act == a_nvr:
+            self._add_device()
+        elif act == a_onvif:
+            self._scan_onvif()
+        elif act == a_rtsp:
+            self._add_manual_rtsp()
+
     def _add_device(self):
         import uuid
         nvr = NVRClient(str(uuid.uuid4()), f'NVR {len(self.devices)+1}')
         dlg = DeviceDialog(nvr, self)
+        dlg.saved.connect(self._on_device_saved)
+        dlg.show()
+
+    def _add_manual_rtsp(self):
+        dlg = ManualRTSPDialog(self)
         dlg.saved.connect(self._on_device_saved)
         dlg.show()
 
@@ -2734,6 +3562,40 @@ class MainWindow(QMainWindow):
         # Auto-connect the new device
         threading.Thread(target=self._connect_device, args=(nvr,), daemon=True).start()
 
+    # ── ONVIF discovery ─────────────────────────────────────────────────────
+    def _scan_onvif(self):
+        self.status.showMessage('Scanning network for ONVIF cameras…')
+        def _run():
+            try:
+                import onvif_client
+                devs = onvif_client.discover(timeout=5)
+            except Exception as e:
+                devs = []
+                print(f'[ONVIF] scan error: {e}')
+            self._onvif_found.emit(devs)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_onvif_found(self, devs):
+        # Drop devices we already have configured (match by host).
+        known = {d.host for d in self.devices}
+        fresh = [d for d in devs if d['host'] not in known]
+        self.status.showMessage(
+            f'ONVIF scan: {len(devs)} found, {len(fresh)} new')
+        dlg = ONVIFScanDialog(fresh, self)
+        dlg.add_cameras.connect(self._add_onvif_cameras)
+        dlg.show()
+
+    def _add_onvif_cameras(self, cams):
+        import uuid
+        for c in cams:   # c = {host, port, xaddr, name, username, password}
+            cam = ONVIFClient(str(uuid.uuid4()), c['name'])
+            cam.host = c['host']; cam.port = c['port']; cam.xaddr = c.get('xaddr')
+            cam.username = c.get('username', ''); cam.password = c.get('password', '')
+            self.devices.append(cam)
+            threading.Thread(target=self._connect_device, args=(cam,), daemon=True).start()
+        NVRClient.save_all(self.devices)
+        self._refresh_device_list()
+
     def _device_context_menu(self, pos):
         from PyQt5.QtWidgets import QMenu
         item = self.dev_list.itemAt(pos)
@@ -2743,21 +3605,54 @@ class MainWindow(QMainWindow):
         nvr = next((d for d in self.devices if d.device_id == dev_id), None)
         if not nvr:
             return
+        connected = any(c.get('_nvr') is nvr for c in self._all_cameras)
         menu = QMenu(self)
         menu.setStyleSheet(f'background:{DARK["panel"]};color:{DARK["text"]};border:1px solid {DARK["border"]};')
+        if connected:
+            conn_action = menu.addAction('Disconnect')
+        else:
+            conn_action = menu.addAction('Connect')
+        menu.addSeparator()
         edit_action   = menu.addAction('Edit')
         remove_action = menu.addAction('Remove')
         action = menu.exec_(self.dev_list.mapToGlobal(pos))
-        if action == edit_action:
+        if action == conn_action:
+            if connected:
+                self._disconnect_device(nvr)
+            elif nvr.host:
+                self.status.showMessage(f'[{nvr.name}] connecting...')
+                threading.Thread(target=self._connect_device, args=(nvr,), daemon=True).start()
+        elif action == edit_action:
             dlg = DeviceDialog(nvr, self)
             dlg.saved.connect(lambda n: (NVRClient.save_all(self.devices), self._refresh_device_list()))
             dlg.show()
         elif action == remove_action:
+            self._disconnect_device(nvr)
             self.devices.remove(nvr)
             NVRClient.save_all(self.devices)
-            self._all_cameras = [c for c in self._all_cameras if c.get('_nvr') is not nvr]
-            self._refresh_camera_list()
             self._refresh_device_list()
+
+    def _disconnect_device(self, nvr):
+        """Drop a device's live connection: stop its streams, log out of the SDK,
+        and remove its cameras from the list. The device stays configured."""
+        if self.audio.is_playing(nvr):
+            self.audio.stop()
+        # Stop any live cells streaming this device's cameras.
+        try:
+            for uid, cell in list(getattr(self.live_tab, 'cells', {}).items()):
+                if self._nvr_map.get(uid) is nvr and getattr(cell, '_streaming', False):
+                    cell.stop_stream()
+        except Exception as e:
+            print(f'[Disconnect] stop streams: {e}')
+        try:
+            nvr.sdk_logout()
+        except Exception as e:
+            print(f'[Disconnect] sdk_logout: {e}')
+        self._all_cameras = [c for c in self._all_cameras if c.get('_nvr') is not nvr]
+        self._nvr_map = {u: n for u, n in self._nvr_map.items() if n is not nvr}
+        self._refresh_camera_list()
+        self._refresh_device_list()
+        self.status.showMessage(f'[{nvr.name}] disconnected')
 
     def _connect_all(self):
         self.status.showMessage('Connecting...')
@@ -2796,14 +3691,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_camera_list(self):
         self.cam_list.clear()
-        multi = len(self.devices) > 1
-        for cam in self._all_cameras:
-            uid    = cam.get('uid', cam['id'])
-            prefix = f'[{cam["nvr_name"]}] ' if multi else ''
-            item = QListWidgetItem(f'📷  {prefix}{cam["name"]}')
-            item.setData(Qt.UserRole, uid)
-            item.setForeground(QColor(DARK['green']))
-            self.cam_list.addItem(item)
+        # Group cameras under an expandable header per device (preserves order).
+        for nvr in self.devices:
+            cams = [c for c in self._all_cameras if c.get('nvr_id') == nvr.device_id]
+            if not cams:
+                continue
+            grp = QTreeWidgetItem(self.cam_list, [f'{nvr.name}  ({len(cams)})'])
+            grp.setData(0, Qt.UserRole, None)          # header → no uid, not draggable
+            grp.setForeground(0, QColor(DARK['dim']))
+            gf = grp.font(0); gf.setBold(True); grp.setFont(0, gf)
+            grp.setFlags(grp.flags() & ~Qt.ItemIsDragEnabled)
+            for cam in cams:
+                uid   = cam.get('uid', cam['id'])
+                child = QTreeWidgetItem(grp, [f'📷  {cam["name"]}'])
+                child.setData(0, Qt.UserRole, uid)
+                child.setForeground(0, QColor(DARK['green']))
+            grp.setExpanded(True)
 
         if self._all_cameras:
             self.live_tab.nvr = self._all_cameras[0]['_nvr']
@@ -2814,18 +3717,20 @@ class MainWindow(QMainWindow):
         self.live_tab.set_cameras(live_cams)
         self.pb_tab.set_cameras(live_cams, self._nvr_map)
 
-    def _cam_clicked(self, item):
-        uid = item.data(Qt.UserRole)
-        if uid:
-            nvr = self._nvr_map.get(uid)
-            if nvr:
-                self.live_tab.nvr = nvr
-            self.live_tab.select_camera(uid)
-            self.tabs.setCurrentIndex(0)
+    def _cam_clicked(self, item, column=0):
+        uid = item.data(0, Qt.UserRole)
+        if not uid:                       # group header → toggle expand/collapse
+            item.setExpanded(not item.isExpanded())
+            return
+        nvr = self._nvr_map.get(uid)
+        if nvr:
+            self.live_tab.nvr = nvr
+        self.live_tab.select_camera(uid)
+        self.tabs.setCurrentIndex(0)
 
-    def _cam_dbl_clicked(self, item):
+    def _cam_dbl_clicked(self, item, column=0):
         """Double-click: switch to live 1×1 and start that camera."""
-        uid = item.data(Qt.UserRole)
+        uid = item.data(0, Qt.UserRole)
         if not uid:
             return
         nvr = self._nvr_map.get(uid)
@@ -2838,22 +3743,84 @@ class MainWindow(QMainWindow):
             cell.start_stream(self.live_tab._should_use_sub())
         self.tabs.setCurrentIndex(0)
 
+    # ── Camera management (ONVIF / RTSP options) ─────────────────────────────
+    def _camera_context_menu(self, pos):
+        from PyQt5.QtWidgets import QMenu
+        item = self.cam_list.itemAt(pos)
+        if not item:
+            return
+        uid = item.data(0, Qt.UserRole)
+        if not uid:
+            return
+        nvr = self._nvr_map.get(uid)
+        if nvr is None:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(f'background:{DARK["panel"]};color:{DARK["text"]};'
+                           f'border:1px solid {DARK["border"]};')
+        manage = None
+        if getattr(nvr, 'device_type', '') in ('onvif', 'rtsp'):
+            manage = menu.addAction('Manage camera…')
+        else:
+            menu.addAction('(no options for NVR cameras)').setEnabled(False)
+        act = menu.exec_(self.cam_list.viewport().mapToGlobal(pos))
+        if manage is not None and act == manage:
+            self._manage_camera(nvr)
+
+    def _manage_camera(self, nvr):
+        dlg = ManageCameraDialog(nvr, self, self)
+        dlg.show()
+
+    def _add_onvif_channels(self, nvr, channels):
+        """Add user-picked RTSP channels as extra cameras under this device."""
+        existing = {c.get('url') for c in getattr(nvr, 'extra_channels', [])}
+        for ch in channels:
+            if ch['url'] not in existing:
+                nvr.extra_channels.append(ch)
+                existing.add(ch['url'])
+        nvr._lenses = []                       # force re-fetch with new channels
+        NVRClient.save_all(self.devices)
+        self.status.showMessage(f'[{nvr.name}] added {len(channels)} channel(s)')
+        threading.Thread(target=self._connect_device, args=(nvr,), daemon=True).start()
+
+    def _set_audio(self, nvr, on):
+        if on:
+            url = nvr.rtsp_live_url('1', sub=False)
+            self.audio.play(url, nvr)
+            self.status.showMessage(f'[{nvr.name}] listening to microphone')
+        else:
+            self.audio.stop()
+            self.status.showMessage('Audio stopped')
+
+    def _restart_nvr_streams(self, nvr):
+        """Restart any live cells belonging to this device (e.g. after a quality
+        change) so the new stream URL takes effect."""
+        for uid, cell in list(self.live_tab.cells.items()):
+            if self._nvr_map.get(uid) is nvr and getattr(cell, '_streaming', False):
+                cell.stop_stream()
+                QTimer.singleShot(300, lambda c=cell: c.start_stream(
+                    self.live_tab._should_use_sub()))
+
 
 # ── Drag-enabled camera list ───────────────────────────────────────────────────
-class CameraListWidget(QListWidget):
-    """Sidebar camera list that supports drag-to-cell."""
+class CameraListWidget(QTreeWidget):
+    """Sidebar camera list grouped per device (expandable). Camera leaf items
+    support drag-to-cell; group (device) headers do not."""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setIndentation(12)
+        self.setRootIsDecorated(True)
         self.setDragEnabled(True)
-        self.setDragDropMode(QListWidget.DragOnly)
+        self.setDragDropMode(QTreeWidget.DragOnly)
         self.setDefaultDropAction(Qt.CopyAction)
 
     def startDrag(self, supported_actions):
         item = self.currentItem()
         if not item:
             return
-        uid = item.data(Qt.UserRole)
-        if not uid:
+        uid = item.data(0, Qt.UserRole)
+        if not uid:   # group header — nothing to drag
             return
         from PyQt5.QtCore import QMimeData
         from PyQt5.QtGui import QDrag
