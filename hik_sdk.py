@@ -60,6 +60,59 @@ class NET_DVR_DEVICEINFO_V30(Structure):
         ('byRes2',               BYTE),
     ]
 
+NAME_LEN = 64
+PASSWD_LEN = 64
+NET_DVR_DEV_ADDRESS_MAX_LEN = 129
+
+# Async login result callback (unused for synchronous login — we pass NULL).
+fLoginResultCallBack = CFUNCTYPE(None, LONG, DWORD,
+                                 POINTER(NET_DVR_DEVICEINFO_V30), c_void_p)
+
+
+class NET_DVR_USER_LOGIN_INFO(Structure):
+    _fields_ = [
+        ('sDeviceAddress', c_char * NET_DVR_DEV_ADDRESS_MAX_LEN),
+        ('byUseTransport', BYTE),
+        ('wPort',          WORD),
+        ('sUserName',      c_char * NAME_LEN),
+        ('sPassword',      c_char * PASSWD_LEN),
+        ('cbLoginResult',  fLoginResultCallBack),
+        ('pUser',          c_void_p),
+        ('bUseAsynLogin',  BOOL),
+        ('byProxyType',    BYTE),
+        ('byUseUTCTime',   BYTE),
+        ('byLoginMode',    BYTE),   # 0=private(SDK/8000), 1=ISAPI(HTTP port), 2=adaptive
+        ('byHttps',        BYTE),
+        ('iProxyID',       LONG),
+        ('byVerifyMode',   BYTE),
+        ('byRes2',         BYTE * 119),
+    ]
+
+
+class NET_DVR_DEVICEINFO_V40(Structure):
+    _fields_ = [
+        ('struDeviceV30',          NET_DVR_DEVICEINFO_V30),
+        ('bySupportLock',          BYTE),
+        ('byRetryLoginTime',       BYTE),
+        ('byPasswordLevel',        BYTE),
+        ('byProxyType',            BYTE),
+        ('dwSurplusLockTime',      DWORD),
+        ('byCharEncodeType',       BYTE),
+        ('bySupportDev5',          BYTE),
+        ('bySupport',              BYTE),
+        ('byLoginMode',            BYTE),
+        ('dwOEMCode',              DWORD),
+        ('iResidualValidity',      c_int),
+        ('byResidualValidity',     BYTE),
+        ('bySingleStartDTalkChan', BYTE),
+        ('bySingleDTalkChanNums',  BYTE),
+        ('byPassWordResetLevel',   BYTE),
+        ('bySupportStreamEncrypt', BYTE),
+        ('byMarketType',           BYTE),
+        ('byRes2',                 BYTE * 238),
+    ]
+
+
 class NET_DVR_TIME(Structure):
     _fields_ = [
         ('dwYear',   DWORD),
@@ -193,6 +246,10 @@ class HCNetSDK:
                                           POINTER(NET_DVR_DEVICEINFO_V30)]
         L.NET_DVR_Login_V30.restype = LONG
 
+        L.NET_DVR_Login_V40.argtypes = [POINTER(NET_DVR_USER_LOGIN_INFO),
+                                          POINTER(NET_DVR_DEVICEINFO_V40)]
+        L.NET_DVR_Login_V40.restype = LONG
+
         L.NET_DVR_Logout.argtypes = [LONG]
         L.NET_DVR_Logout.restype = BOOL
 
@@ -245,6 +302,26 @@ class HCNetSDK:
         if user_id < 0:
             raise RuntimeError(f'Login to {host}:{port} failed: {self.last_error()}')
         return user_id, info
+
+    def login_v40(self, host, port, username='admin', password='', login_mode=1):
+        """Login via NET_DVR_Login_V40. login_mode=1 (ISAPI over the HTTP port)
+        works on OEM rebrands (Safire/Sapphire by Hik) that reject the legacy
+        V30 private-protocol login on port 8000 with a bogus 'user/password
+        error'. Returns (user_id, NET_DVR_DEVICEINFO_V30) on success."""
+        info = NET_DVR_USER_LOGIN_INFO()
+        info.sDeviceAddress = host.encode('utf-8')
+        info.wPort          = port
+        info.sUserName      = username.encode('utf-8')
+        info.sPassword      = password.encode('utf-8')
+        info.bUseAsynLogin  = 0
+        info.byLoginMode    = login_mode
+        dev = NET_DVR_DEVICEINFO_V40()
+        user_id = self.lib.NET_DVR_Login_V40(byref(info), byref(dev))
+        if user_id < 0:
+            raise RuntimeError(
+                f'Login_V40(mode={login_mode}) to {host}:{port} failed: '
+                f'{self.last_error()} lock={dev.dwSurplusLockTime}s')
+        return user_id, dev.struDeviceV30
 
     def logout(self, user_id):
         if user_id >= 0:
