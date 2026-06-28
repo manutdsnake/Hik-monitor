@@ -1,10 +1,12 @@
 # Hik Monitor
+Added support for Safire device (playback only, live view doesnt work)
+Added support for ONVIF devices
 
 My personal project of desktop application for monitoring Hikvision NVR systems on Linux.  
 Supports live view, multi-camera grid layouts, recording playback, and timeline navigation.
 
 If something is broken I most likely won't fix it but you are free to. 
-It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x)
+It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x) and Lenovo L340 (nvidia gpu)
 
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
