@@ -42,6 +42,7 @@ modules:
       - install -Dm644 hik_play.py      /app/share/hik-monitor/hik_play.py
       - install -Dm644 onvif_client.py  /app/share/hik-monitor/onvif_client.py
       - install -Dm644 sdk_installer.py /app/share/hik-monitor/sdk_installer.py
+      - install -Dm644 LICENSE /app/share/licenses/io.github.manutdsnake.Hik-monitor/LICENSE
       - install -Dm755 flatpak/hik-monitor.sh /app/bin/hik-monitor
       - install -Dm644 flatpak/io.github.manutdsnake.Hik-monitor.desktop
           /app/share/applications/io.github.manutdsnake.Hik-monitor.desktop
