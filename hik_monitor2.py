@@ -19,7 +19,14 @@ def _bootstrap_sdk_path():
                or os.path.expanduser('~/Desktop/sdk/lib')
     sdk_path = os.path.abspath(sdk_path)
     if not os.path.isdir(sdk_path):
-        return   # no SDK installed — app will run RTSP-only
+        # Fall back to the auto-installed location (see sdk_installer.py), where
+        # the on-demand SDK download puts the lib tree.
+        xdg = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+        alt = os.path.join(xdg, 'hikvision-monitor', 'sdk', 'lib')
+        if os.path.isdir(alt):
+            sdk_path = alt
+        else:
+            return   # no SDK installed — app will run ONVIF/RTSP-only
     com_path = os.path.join(sdk_path, 'HCNetSDKCom')
     parts = (os.environ.get('LD_LIBRARY_PATH', '') or '').split(':')
     if sdk_path in parts:
@@ -179,7 +186,7 @@ from PyQt5.QtWidgets import (
     QDateEdit, QListWidget, QListWidgetItem, QSplitter, QFrame,
     QGroupBox, QScrollArea, QSizePolicy, QProgressBar, QStatusBar,
     QTabWidget, QMessageBox, QToolBar, QAction, QSlider, QStyle,
-    QTreeWidget, QTreeWidgetItem
+    QTreeWidget, QTreeWidgetItem, QDialog
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QDate, QSize, QMutex, QMutexLocker,
@@ -3380,7 +3387,7 @@ class DeviceDialog(QWidget):
         self.f_pass.setEchoMode(QLineEdit.Password)
         lay.addWidget(self.f_pass)
 
-        self.btn_test = QPushButton('Test & Save')
+        self.btn_test = QPushButton('Save')
         self.btn_test.setStyleSheet(f'background:{DARK["accent"]};color:white;font-weight:600;padding:8px;')
         self.btn_test.clicked.connect(self._test_and_save)
         lay.addWidget(self.btn_test)
@@ -3397,7 +3404,7 @@ class DeviceDialog(QWidget):
         self._nvr.username = self.f_user.text().strip()
         self._nvr.password = self.f_pass.text()
 
-        self.btn_test.setText('Testing...')
+        self.btn_test.setText('Saving...')
         self.btn_test.setEnabled(False)
 
         def _run():
@@ -3410,10 +3417,106 @@ class DeviceDialog(QWidget):
             else:
                 self.lbl_status.setText(f'✗ {msg}')
                 self.lbl_status.setStyleSheet(f'font-size:12px;color:{DARK["red"]};')
-            self.btn_test.setText('Test & Save')
+            self.btn_test.setText('Save')
             self.btn_test.setEnabled(True)
 
         threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Hikvision SDK on-demand installer dialog ────────────────────────────────────
+class SDKInstallDialog(QDialog):
+    """Downloads and installs the proprietary Hikvision HCNetSDK on user
+    confirmation. The SDK is not bundled with the app; this fetches it on demand
+    into the per-user data dir. On success the caller restarts the app so the
+    SDK is loaded at startup. See sdk_installer.py for the actual work."""
+    _progress = pyqtSignal(str, object)   # stage, frac (0..1 or None)
+    _done     = pyqtSignal(bool, str)     # ok, error message
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Install Hikvision SDK')
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        self.installed = False
+
+        v = QVBoxLayout(self)
+        self.lbl = QLabel(
+            'Connecting to Hikvision / Safire NVRs needs the Hikvision HCNetSDK, '
+            'which is proprietary and is not bundled with this app.\n\n'
+            'Click Install to download (~70 MB) and set it up automatically. '
+            'ONVIF and RTSP cameras work without it.')
+        self.lbl.setWordWrap(True)
+        v.addWidget(self.lbl)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self.bar.hide()
+        v.addWidget(self.bar)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self.btn_cancel = QPushButton('Not now')
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_install = QPushButton('Install')
+        self.btn_install.setStyleSheet(
+            f'background:{DARK["accent"]};color:white;font-weight:600;padding:6px 14px;')
+        self.btn_install.clicked.connect(self._start)
+        row.addWidget(self.btn_cancel)
+        row.addWidget(self.btn_install)
+        v.addLayout(row)
+
+        self._progress.connect(self._on_progress)
+        self._done.connect(self._on_done)
+
+    def _start(self):
+        self.btn_install.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        self.bar.show()
+        self.lbl.setText('Downloading Hikvision SDK…')
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        try:
+            import sdk_installer
+            sdk_installer.download_and_install(
+                progress_cb=lambda stage, frac: self._progress.emit(stage, frac))
+            self._done.emit(True, '')
+        except Exception as e:
+            self._done.emit(False, str(e))
+
+    def _on_progress(self, stage, frac):
+        if stage == 'download':
+            self.lbl.setText('Downloading Hikvision SDK…')
+            if frac is None:
+                self.bar.setRange(0, 0)            # indeterminate (busy)
+            else:
+                self.bar.setRange(0, 100)
+                self.bar.setValue(int(frac * 100))
+        elif stage == 'extract':
+            self.lbl.setText('Extracting…')
+            self.bar.setRange(0, 0)
+        elif stage == 'install':
+            self.lbl.setText('Installing…')
+            self.bar.setRange(0, 0)
+
+    def _on_done(self, ok, err):
+        if ok:
+            self.installed = True
+            QMessageBox.information(
+                self, 'SDK installed',
+                'Hikvision SDK installed successfully.\n'
+                'The app will now restart to load it.')
+            self.accept()
+        else:
+            self.bar.hide()
+            self.lbl.setText(
+                f'Install failed:\n{err}\n\n'
+                'You can still use ONVIF and RTSP cameras.')
+            self.btn_cancel.setEnabled(True)
+            self.btn_cancel.setText('Close')
+            self.btn_install.setEnabled(True)
+            self.btn_install.setText('Retry')
 
 
 # ── Main Window ────────────────────────────────────────────────────────────────
@@ -3493,6 +3596,33 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.cam_list)
         sb.setStretch(sb.count()-1, 1)
 
+        # Support link — pinned at the bottom of the sidebar, always visible
+        coffee = QLabel(
+            '<a href="https://buymeacoffee.com/manutdsnake" '
+            'style="text-decoration:none;color:#0d1117;">☕  Buy me a coffee</a>'
+        )
+        coffee.setOpenExternalLinks(True)
+        coffee.setAlignment(Qt.AlignCenter)
+        coffee.setToolTip('Support development — buymeacoffee.com/manutdsnake')
+        coffee.setStyleSheet(
+            'background:#FFDD00;border-radius:6px;padding:7px;'
+            'font-weight:700;font-size:12px;margin-top:8px;'
+        )
+        sb.addWidget(coffee)
+
+        kofi = QLabel(
+            '<a href="https://ko-fi.com/manutdsnake" '
+            'style="text-decoration:none;color:#ffffff;">❤  Support on Ko-fi</a>'
+        )
+        kofi.setOpenExternalLinks(True)
+        kofi.setAlignment(Qt.AlignCenter)
+        kofi.setToolTip('Support development — ko-fi.com/manutdsnake')
+        kofi.setStyleSheet(
+            'background:#FF5E5B;border-radius:6px;padding:7px;'
+            'font-weight:700;font-size:12px;margin-top:6px;'
+        )
+        sb.addWidget(kofi)
+
         root.addWidget(sidebar)
 
         # Main tabs
@@ -3536,11 +3666,34 @@ class MainWindow(QMainWindow):
         pos = btn.mapToGlobal(btn.rect().bottomLeft()) if btn else self.cursor().pos()
         act = m.exec_(pos)
         if act == a_nvr:
+            # Hikvision/Safire NVRs need the native SDK. Offer to install it
+            # on demand if it's missing (the app restarts on success).
+            if self._maybe_offer_sdk():
+                return
             self._add_device()
         elif act == a_onvif:
             self._scan_onvif()
         elif act == a_rtsp:
             self._add_manual_rtsp()
+
+    def _maybe_offer_sdk(self):
+        """If the native Hikvision SDK isn't loaded, offer to download+install
+        it. Returns True if a restart was triggered (caller should stop)."""
+        if _SDK is not None:
+            return False
+        try:
+            import sdk_installer
+        except ImportError:
+            return False
+        if sdk_installer.is_installed():
+            return False   # present but not loaded — nothing to download
+        dlg = SDKInstallDialog(self)
+        dlg.exec_()
+        if dlg.installed:
+            os.environ['HIKVISION_SDK_PATH'] = str(sdk_installer.install_lib_dir())
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+            return True   # not reached (process replaced)
+        return False
 
     def _add_device(self):
         import uuid

@@ -1,0 +1,60 @@
+id: io.github.manutdsnake.Hik-monitor
+runtime: org.kde.Platform
+runtime-version: '5.15-25.08'      # Qt5 LTS runtime (latest, non-EOL)
+sdk: org.kde.Sdk
+# PyQt5 + Qt5 come from the official Riverbank base app (the Flathub-recommended
+# way to ship PyQt apps) — don't pip-install PyQt5 yourself.
+base: com.riverbankcomputing.PyQt.BaseApp
+base-version: '5.15-25.08'
+command: hik-monitor
+
+finish-args:
+  - --share=network                # cameras + on-demand SDK download
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio            # SDK audio (libopenal) / two-way talk
+  - --device=dri                   # VAAPI GPU decode
+  - --filesystem=xdg-download      # saving recording downloads
+  # SDK installs into the app's own data dir (~/.var/app/<id>/data) — no extra
+  # filesystem permission needed for that.
+  # NOTE: the KDE runtime already ships the ffmpeg/ffprobe CLI (the app shells
+  # out to them for playback), so no ffmpeg extension is needed.
+
+modules:
+  # ── Python dependencies ──────────────────────────────────────────────────
+  # Flathub builds OFFLINE, so deps must be pre-pinned with sha256. Generate
+  # python3-modules.yaml once with flatpak-pip-generator (see flatpak/README.md):
+  #
+  #   flatpak-pip-generator --runtime=org.kde.Sdk//5.15-25.08 \
+  #       opencv-python-headless numpy requests   (NOT PyQt5 — from BaseApp)
+  #
+  # NOTE: use opencv-python-HEADLESS (not opencv-python) — the GUI build bundles
+  # its own Qt and clashes with PyQt5.
+  - python3-modules.yaml
+
+  # ── The application itself ───────────────────────────────────────────────
+  - name: hik-monitor
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 hik_monitor2.py  /app/share/hik-monitor/hik_monitor2.py
+      - install -Dm644 hik_sdk.py       /app/share/hik-monitor/hik_sdk.py
+      - install -Dm644 hik_play.py      /app/share/hik-monitor/hik_play.py
+      - install -Dm644 onvif_client.py  /app/share/hik-monitor/onvif_client.py
+      - install -Dm644 sdk_installer.py /app/share/hik-monitor/sdk_installer.py
+      - install -Dm755 flatpak/hik-monitor.sh /app/bin/hik-monitor
+      - install -Dm644 flatpak/io.github.manutdsnake.Hik-monitor.desktop
+          /app/share/applications/io.github.manutdsnake.Hik-monitor.desktop
+      - install -Dm644 flatpak/io.github.manutdsnake.Hik-monitor.metainfo.xml
+          /app/share/metainfo/io.github.manutdsnake.Hik-monitor.metainfo.xml
+      - install -Dm644 flatpak/io.github.manutdsnake.Hik-monitor.svg
+          /app/share/icons/hicolor/scalable/apps/io.github.manutdsnake.Hik-monitor.svg
+    sources:
+      # For local builds: the working copy. For the Flathub submission, replace
+      # with a pinned git source, e.g.:
+      #   - type: git
+      #     url: https://github.com/manutdsnake/Hik-monitor.git
+      #     tag: v1.0.0
+      #     commit: <full-sha>
+      - type: dir
+        path: ..

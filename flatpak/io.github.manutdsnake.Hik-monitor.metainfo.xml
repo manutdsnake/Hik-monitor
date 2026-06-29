@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.manutdsnake.Hik-monitor</id>
+
+  <name>Hik Monitor</name>
+  <summary>View and record Hikvision NVR cameras</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <developer id="io.github.manutdsnake">
+    <name>manutdsnake</name>
+  </developer>
+
+  <description>
+    <p>
+      Hik Monitor is a desktop application for monitoring Hikvision NVR systems
+      on Linux. It supports live view with multi-camera grid layouts, recording
+      playback with timeline scrubbing, and works with Hikvision, Safire
+      (Hikvision-OEM), generic ONVIF cameras, and manual RTSP streams.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Live view with 1x1, 2x2, 3x3, 4x4, 1+3 and 1+7 grid layouts</li>
+      <li>Recording search and playback with timeline scrubbing and speed control</li>
+      <li>Multi-NVR support and drag-and-drop cameras into grid cells</li>
+      <li>GPU-accelerated playback via VAAPI when available</li>
+      <li>ONVIF discovery and manual RTSP — work without any vendor SDK</li>
+    </ul>
+    <p>
+      Live view and playback for native Hikvision devices use the proprietary
+      Hikvision HCNetSDK, which is owned by Hikvision and is not bundled with
+      this application. When you add a Hikvision or Safire NVR, the app offers to
+      download and install the SDK on demand into its own data directory; ONVIF
+      and RTSP cameras work without it.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.manutdsnake.Hik-monitor.desktop</launchable>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+  </categories>
+
+  <content_rating type="oars-1.1"/>
+
+  <url type="homepage">https://github.com/manutdsnake/Hik-monitor</url>
+  <url type="bugtracker">https://github.com/manutdsnake/Hik-monitor/issues</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/flatpak/screenshots/1.png</image>
+      <caption>Live view with multi-camera grid</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/flatpak/screenshots/2.png</image>
+      <caption>Adding a device</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="1.0.0" date="2026-06-29">
+      <description>
+        <p>First Flatpak release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
