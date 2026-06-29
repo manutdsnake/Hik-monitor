@@ -1,0 +1,39 @@
+# Maintainer: manutdsnake <manutdsnake@users.noreply.github.com>
+pkgname=hik-monitor
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="View and record Hikvision/Safire/ONVIF NVR cameras — a native Linux alternative to iVMS-4200"
+arch=('x86_64')
+url="https://github.com/manutdsnake/Hik-monitor"
+license=('MIT')
+depends=('python' 'python-pyqt5' 'python-opencv' 'python-numpy' 'python-requests' 'ffmpeg' 'hicolor-icon-theme')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/manutdsnake/Hik-monitor/archive/refs/tags/v$pkgver.tar.gz")
+# Replace SKIP with the real checksum once the v1.0.0 tag exists:
+#   updpkgsums   (or: sha256sum the downloaded tarball)
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/Hik-monitor-$pkgver"
+
+  # App modules
+  install -dm755 "$pkgdir/usr/share/hik-monitor"
+  install -m644 hik_monitor2.py hik_sdk.py hik_play.py onvif_client.py sdk_installer.py \
+    "$pkgdir/usr/share/hik-monitor/"
+
+  # Launcher
+  install -dm755 "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/hik-monitor" <<'EOF'
+#!/bin/sh
+cd /usr/share/hik-monitor
+exec python3 hik_monitor2.py "$@"
+EOF
+  chmod 755 "$pkgdir/usr/bin/hik-monitor"
+
+  # Desktop entry + icon (Icon= / Exec= already match this layout)
+  install -Dm644 flatpak/io.github.manutdsnake.Hik-monitor.desktop \
+    "$pkgdir/usr/share/applications/io.github.manutdsnake.Hik-monitor.desktop"
+  install -Dm644 flatpak/io.github.manutdsnake.Hik-monitor.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.manutdsnake.Hik-monitor.svg"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

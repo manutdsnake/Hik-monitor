@@ -1,148 +1,92 @@
 # Hik Monitor
-Added support for Safire device (playback only, live view doesnt work)
-Added support for ONVIF devices
 
-My personal project of desktop application for monitoring Hikvision NVR systems on Linux.  
-Supports live view, multi-camera grid layouts, recording playback, and timeline navigation.
+A Linux desktop app for viewing and recording Hikvision, Safire and ONVIF NVR cameras.
+I wrote it for my own NVR because iVMS-4200 has no proper Linux build.
 
-If something is broken I most likely won't fix it but you are free to. 
-It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x) and Lenovo L340 (nvidia gpu)
-
-
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
-
----
+![Hik Monitor](flatpak/screenshots/1.png)
 
 ## Features
 
-- Live view with 1×1, 2×2, 3×3, 4×4, 1+3, and 1+7 grid layouts
-- Recording search and playback with timeline scrubbing
-- Playback speed control (0.25× to 8×)
-- Multi-NVR support
-- Native Hikvision SDK decode via PlayCtrl (no ffmpeg required for live view)
-- On-demand SDK installer — when you add a Hikvision/Safire NVR without the SDK present, the app offers to download and install it automatically (no manual setup)
-- GPU-accelerated playback via VAAPI (if available)
-- RTSP / ONVIF fallback for environments without the SDK
-- Drag-and-drop cameras into grid cells
-- Dark theme UI
+- Live view with 1×1, 2×2, 3×3, 4×4, 1+3 and 1+7 grid layouts
+- Recording playback with timeline scrubbing and 0.25×–8× speed
+- Multiple NVRs, drag-and-drop cameras into grid cells
+- Native Hikvision/Safire (HCNetSDK), generic ONVIF, and manual RTSP
+- GPU-accelerated decoding via VAAPI when available
+- Dark theme
 
----
+ONVIF and RTSP cameras work without any SDK. For native Hikvision/Safire devices
+the app uses the Hikvision HCNetSDK, which it offers to download on first use.
 
-## Requirements
+## Install
 
-Copy this to your terminal, it should install automatically: 
-in case of any issues, follow install.md
+### Flatpak (any distro)
+
+Grab `Hik-monitor-x86_64.flatpak` from the [latest release](https://github.com/manutdsnake/Hik-monitor/releases/latest):
+
+```bash
+flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install --user ./Hik-monitor-x86_64.flatpak
+flatpak run io.github.manutdsnake.Hik-monitor
+```
+
+### Debian / Ubuntu
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/install.sh | bash
 ```
 
-### System
+### Arch / Manjaro
 
-- Linux (Ubuntu 20.04 / 22.04 or newer recommended), x86_64
-- Python 3.8 or newer
-- ffmpeg (for playback)
+See `packaging/aur/PKGBUILD`.
 
-```bash
-sudo apt install ffmpeg python3 python3-pip python3.14-venv
-```
-
-### Python packages
+### From source
 
 ```bash
+sudo apt install ffmpeg python3 python3-pip python3-venv
+git clone https://github.com/manutdsnake/Hik-monitor.git
+cd Hik-monitor
 pip install PyQt5 requests opencv-python numpy
-```
-
-### Hikvision SDK
-
-The application uses the Hikvision HCNetSDK and PlayCtrl SDK libraries, which are
-proprietary (owned by Hikvision). You can get them one of two ways:
-
-1. **Automatic (recommended)** — just run the app and add a Hikvision/Safire NVR.
-   When the SDK is missing, the app offers to download and install it for you
-   into `~/.local/share/hikvision-monitor/sdk/lib`, then restarts to load it.
-2. **Manual** — place the SDK lib tree yourself (see Folder Structure below) and
-   the app will use it, either at `~/Desktop/sdk/lib` or wherever
-   `HIKVISION_SDK_PATH` points.
-
-ONVIF and RTSP cameras work without the SDK at all.
-
----
-
-## Folder Structure
-
-If you install the SDK **manually**, the lib tree must look like this (skip this
-entirely if you let the app download the SDK automatically):
-
-```
-hik-monitor/
-├── hik_monitor2.py
-├── hik_sdk.py
-├── hik_play.py
-├── requirements.txt
-└── sdk/
-    └── lib/
-        ├── libhcnetsdk.so
-        ├── libPlayCtrl.so
-        ├── libHCCore.so
-        ├── libcrypto.so.1.1
-        ├── libssl.so.1.1
-        ├── libz.so
-        ├── libAudioRender.so
-        ├── libSuperRender.so
-        └── HCNetSDKCom/
-            ├── libHCNetSDKComAnalyzeData.so
-            ├── libHCNetSDKComNPQ.so
-            └── (other HCNetSDKCom .so files)
-```
-
-The application looks for the SDK in this order: the `HIKVISION_SDK_PATH`
-environment variable, then `~/Desktop/sdk/lib`, then the auto-install location
-`~/.local/share/hikvision-monitor/sdk/lib`.
-
----
-
-## Installation
-
-See [INSTALL.md](INSTALL.md) for step-by-step instructions.
-
----
-
-## Usage
-
-```bash
-cd hik-monitor
 python3 hik_monitor2.py
 ```
 
-On first launch, click **+** in the sidebar to add your NVR:
+## Usage
 
-- **IP address** — your NVR's local IP (e.g. `192.168.1.64`)
-- **Port** — HTTP port, usually `80`
-- **Username / Password** — your NVR login credentials
+Click **+** in the sidebar to add a device:
 
-Click **Save**, then **Connect All**.  
-Cameras will appear in the sidebar. Click or drag them into the grid to start streaming.
+- **NVR (Hikvision / Safire)** — IP, port, username, password
+- **Scan ONVIF network** — auto-discover ONVIF cameras
+- **Manual RTSP URL** — anything else
 
-### Environment variables
+Click **Save**, then **Connect All**. Cameras appear in the sidebar; click or drag
+them into the grid to start streaming.
 
-| Variable | Default | Description |
-|---|---|---|
-| `HIKVISION_SDK_PATH` | `~/Desktop/sdk/lib` | Path to the SDK lib folder |
+## Hikvision SDK
 
----
+Native Hikvision/Safire live view and playback use the Hikvision HCNetSDK
+(proprietary, owned by Hikvision). It isn't bundled — when you add such a device,
+the app downloads and installs it into `~/.local/share/hik-monitor/sdk`. ONVIF and
+RTSP cameras don't need it.
 
-## Tested On
+The app looks for the SDK at `HIKVISION_SDK_PATH`, then `~/Desktop/sdk/lib`, then
+the auto-install location.
 
-| NVR Model | Firmware | Status |
-|---|---|---|
-| DS-7604NI-K1/4P | V4.x | ✅ Working |
-| DS-7608NI-Q1 | V? | ✅ Working |
-Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x
----
+## Tested on
+
+| Device | Status |
+|---|---|
+| DS-7604NI-K1/4P | Working |
+| DS-7608NI-Q1 | Working |
+| Safire SF-NVR3104-W (Hikvision-OEM) | Playback |
+| O-KAM / generic ONVIF | Working |
+
+Runs on Ubuntu/Kubuntu with AMD and NVIDIA GPUs.
+
+## Notes
+
+This is a personal project. It works for my setup; if something's broken for yours,
+open an issue with your NVR model and firmware, or send a PR.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).  
-Hikvision SDK libraries are owned by Hikvision and remain subject to their own terms.
+MIT — see [LICENSE](LICENSE). The Hikvision SDK libraries are owned by Hikvision
+and remain subject to their own terms.

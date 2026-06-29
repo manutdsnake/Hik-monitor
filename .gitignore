@@ -26,3 +26,4 @@ testbuild-dir/
 .flatpak-builder/
 *.flatpak
 repo/
+bundle-repo/
