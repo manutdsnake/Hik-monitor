@@ -35,10 +35,6 @@ flatpak run io.github.manutdsnake.Hik-monitor
 curl -fsSL https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/install.sh | bash
 ```
 
-### Arch / Manjaro
-
-See `packaging/aur/PKGBUILD`.
-
 ### From source
 
 ```bash
