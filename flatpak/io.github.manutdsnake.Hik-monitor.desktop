@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hik Monitor
+GenericName=NVR Viewer
+Comment=View and record Hikvision NVR cameras — live view, playback, ONVIF/RTSP
+Exec=hik-monitor
+Icon=io.github.manutdsnake.Hik-monitor
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=Hikvision;NVR;CCTV;Camera;ONVIF;RTSP;Surveillance;Safire;

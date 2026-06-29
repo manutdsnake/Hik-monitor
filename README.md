@@ -22,8 +22,9 @@ It works for my NVRs on my system (Ubuntu 26.04, AMD GPU 5070XT, Ryzen 5 7600x) 
 - Playback speed control (0.25× to 8×)
 - Multi-NVR support
 - Native Hikvision SDK decode via PlayCtrl (no ffmpeg required for live view)
+- On-demand SDK installer — when you add a Hikvision/Safire NVR without the SDK present, the app offers to download and install it automatically (no manual setup)
 - GPU-accelerated playback via VAAPI (if available)
-- RTSP fallback for environments without the SDK
+- RTSP / ONVIF fallback for environments without the SDK
 - Drag-and-drop cameras into grid cells
 - Dark theme UI
 
@@ -55,14 +56,24 @@ pip install PyQt5 requests opencv-python numpy
 
 ### Hikvision SDK
 
-The application uses the Hikvision HCNetSDK and PlayCtrl SDK libraries.  
-These are included in the repository or you can get them from Hikvision.
+The application uses the Hikvision HCNetSDK and PlayCtrl SDK libraries, which are
+proprietary (owned by Hikvision). You can get them one of two ways:
+
+1. **Automatic (recommended)** — just run the app and add a Hikvision/Safire NVR.
+   When the SDK is missing, the app offers to download and install it for you
+   into `~/.local/share/hikvision-monitor/sdk/lib`, then restarts to load it.
+2. **Manual** — place the SDK lib tree yourself (see Folder Structure below) and
+   the app will use it, either at `~/Desktop/sdk/lib` or wherever
+   `HIKVISION_SDK_PATH` points.
+
+ONVIF and RTSP cameras work without the SDK at all.
 
 ---
 
 ## Folder Structure
 
-Your project folder **must** look exactly like this before running:
+If you install the SDK **manually**, the lib tree must look like this (skip this
+entirely if you let the app download the SDK automatically):
 
 ```
 hik-monitor/
@@ -86,8 +97,9 @@ hik-monitor/
             └── (other HCNetSDKCom .so files)
 ```
 
-The application looks for the SDK at `~/Desktop/sdk/lib` by default, or at the path set in the `HIKVISION_SDK_PATH` environment variable.  
-If you clone into your home folder, the default path works automatically.
+The application looks for the SDK in this order: the `HIKVISION_SDK_PATH`
+environment variable, then `~/Desktop/sdk/lib`, then the auto-install location
+`~/.local/share/hikvision-monitor/sdk/lib`.
 
 ---
 
@@ -110,7 +122,7 @@ On first launch, click **+** in the sidebar to add your NVR:
 - **Port** — HTTP port, usually `80`
 - **Username / Password** — your NVR login credentials
 
-Click **Test & Save**, then **Connect All**.  
+Click **Save**, then **Connect All**.  
 Cameras will appear in the sidebar. Click or drag them into the grid to start streaming.
 
 ### Environment variables
