@@ -19,3 +19,10 @@ start.sh
 
 # Downloaded SDK archives
 *.zip
+
+# Flatpak build artifacts
+build-dir/
+testbuild-dir/
+.flatpak-builder/
+*.flatpak
+repo/
