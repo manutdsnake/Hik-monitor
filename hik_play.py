@@ -19,13 +19,14 @@ _ensure_ld_path()
 import ctypes
 from ctypes import (
     c_char, c_char_p, c_int, c_uint, c_long, c_ulong, c_void_p,
-    c_byte, c_ubyte, POINTER, Structure, CFUNCTYPE, byref, cast
+    c_byte, c_ubyte, c_ushort, POINTER, Structure, CFUNCTYPE, byref, cast
 )
 
 BYTE  = c_ubyte
 PBYTE = POINTER(c_ubyte)
 LONG  = c_int
 DWORD = c_uint
+WORD  = c_ushort
 BOOL  = c_int
 HWND  = c_void_p
 
@@ -106,6 +107,15 @@ class PlayM4:
         lib.PlayM4_GetLastError.restype      = DWORD
         lib.PlayM4_GetSourceBufferRemain.argtypes = [LONG]
         lib.PlayM4_GetSourceBufferRemain.restype  = DWORD
+        # Audio output (the same path iVMS uses): PlayM4 decodes the audio track
+        # embedded in the live/playback stream and renders it via libAudioRender.
+        # Only one port plays sound at a time (global g_bPlaySound in the lib).
+        lib.PlayM4_PlaySound.argtypes        = [LONG]
+        lib.PlayM4_PlaySound.restype         = BOOL
+        lib.PlayM4_StopSound.argtypes        = [LONG]
+        lib.PlayM4_StopSound.restype         = BOOL
+        lib.PlayM4_SetVolume.argtypes        = [LONG, WORD]
+        lib.PlayM4_SetVolume.restype         = BOOL
 
         cls._lib = lib
         return lib
@@ -118,9 +128,37 @@ class PlayM4:
         self._opened = False
         self._stream_open = False
         self._realtime = True
+        self._audio_on = False     # desired audio state (applied once playing)
+        self._volume   = 1.0       # 0.0–1.0
 
     def last_error(self):
         return self.lib.PlayM4_GetLastError(self.port)
+
+    # ── Audio (PlayM4 renders the stream's audio track, like iVMS) ───────────
+    def set_audio(self, on):
+        """Enable/disable sound for this port. Safe to call before the stream is
+        open — the state is applied once playback starts."""
+        self._audio_on = bool(on)
+        if self._stream_open and self.port.value >= 0:
+            try:
+                if self._audio_on:
+                    self.lib.PlayM4_PlaySound(self.port)
+                    self._apply_volume()
+                else:
+                    self.lib.PlayM4_StopSound(self.port)
+            except Exception as e:
+                print(f'[PlayM4 set_audio] {e}')
+
+    def set_volume(self, v):
+        self._volume = max(0.0, min(1.0, float(v)))
+        if self._stream_open and self._audio_on:
+            self._apply_volume()
+
+    def _apply_volume(self):
+        try:
+            self.lib.PlayM4_SetVolume(self.port, WORD(int(self._volume * 0xFFFF)))
+        except Exception as e:
+            print(f'[PlayM4 set_volume] {e}')
 
     def open(self, on_frame, realtime=True):
         self._on_frame = on_frame
@@ -167,6 +205,9 @@ class PlayM4:
             raise RuntimeError(f'PlayM4_Play failed err={err}')
 
         self._stream_open = True
+        # Start audio now if it was requested before the stream opened.
+        if self._audio_on:
+            self.set_audio(True)
 
     def input(self, data: bytes, is_header: bool = False):
         if not self._opened:
@@ -207,6 +248,8 @@ class PlayM4:
     def close(self):
         if not self._opened:
             return
+        try: self.lib.PlayM4_StopSound(self.port)
+        except: pass
         try: self.lib.PlayM4_Stop(self.port)
         except: pass
         try: self.lib.PlayM4_CloseStream(self.port)

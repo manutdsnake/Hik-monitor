@@ -157,6 +157,30 @@ if _VAAPI_NODE:
     print(f'[App] VAAPI GPU decode available at {_VAAPI_NODE} — playback will use GPU')
 else:
     print('[App] VAAPI HEVC decode not available — playback will use CPU decode')
+
+
+def _detect_audio_out():
+    """Pick an ffmpeg audio OUTPUT device for playback sound. Prefer PulseAudio
+    (works with PipeWire too), fall back to ALSA. Returns (fmt, target) or
+    (None, None) if ffmpeg has no usable audio output — in which case playback
+    stays video-only. `target` for pulse is a stream name shown in the mixer."""
+    import subprocess as sp
+    try:
+        out = sp.run(['ffmpeg', '-hide_banner', '-devices'],
+                     capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return (None, None)
+    if 'pulse' in out:
+        return ('pulse', 'Hikvision Monitor')
+    if 'alsa' in out:
+        return ('alsa', 'default')
+    return (None, None)
+
+_AUDIO_FMT, _AUDIO_TARGET = _detect_audio_out()
+if _AUDIO_FMT:
+    print(f'[App] Playback audio via ffmpeg -f {_AUDIO_FMT}')
+else:
+    print('[App] No ffmpeg audio output device — playback will be silent')
 _SDK = None   # safe default if the SDK fails to load (ONVIF/RTSP still work)
 try:
     from hik_sdk import HCNetSDK
@@ -169,6 +193,7 @@ except ImportError:
     print('[App] hik_sdk.py not found — playback will use RTSP/HTTP only')
 
 # PlayM4 native decoder (libPlayCtrl.so) — decodes without ffmpeg, like iVMS-4200
+_PLAYM4_OK = False
 try:
     from hik_play import PlayM4, yv12_to_rgb
     _PLAYM4_OK = True
@@ -940,6 +965,11 @@ class VideoWorker(QThread):
         self.fps        = 25.0
         # Backpressure flag — True while a frame is queued but not yet displayed
         self._frame_in_flight = False
+        # Audio (playback): the same ffmpeg that decodes video also routes the
+        # recording's audio track to PulseAudio, so A/V share one clock.
+        self.audio_on   = True       # user mute toggle
+        self.volume     = 1.0        # 0.0–1.0, applied via ffmpeg 'volume' filter
+        self._has_audio = None       # None=unprobed, then True/False for the file
 
     # ── Public control ─────────────────────────────────────────────────────────
     def pause(self):
@@ -954,6 +984,62 @@ class VideoWorker(QThread):
             except: pass
     def is_paused(self): return self._pause.is_set()
     def set_speed(self, s): self.speed = s
+    def set_audio(self, on):
+        self.audio_on = bool(on)
+        # PlayM4's own audio render (libAudioRender) stays silent under PipeWire,
+        # so LIVE audio is handled separately via RTSP→ffmpeg→pulse. Only drive
+        # PlayM4 sound for the OEM PLAYBACK-via-PlayM4 path (no ffmpeg file there).
+        p = self._player
+        if p is not None and self._sdk_mode != 'live':
+            try: p.set_audio(self.audio_on)
+            except Exception: pass
+
+    def set_volume(self, v):
+        self.volume = max(0.0, min(1.0, float(v)))
+        p = self._player
+        if p is not None and self._sdk_mode != 'live':
+            try: p.set_volume(self.volume)
+            except Exception: pass
+
+    def _probe_has_audio(self, path):
+        """Detect an audio stream in the recording file. A positive result is
+        cached; a negative one is only cached once the download is complete, so
+        we re-probe a still-growing file rather than latching 'no audio'."""
+        if self._has_audio:
+            return True
+        import subprocess as sp
+        found = False
+        try:
+            r = sp.run(['ffprobe', '-v', 'error', '-select_streams', 'a',
+                        '-show_entries', 'stream=index', '-of', 'csv=p=0', path],
+                       capture_output=True, text=True, timeout=5)
+            found = bool(r.stdout.strip())
+        except Exception:
+            found = False
+        if found or self._dl_complete:
+            self._has_audio = found
+        return found
+
+    def _audio_active(self, path):
+        """True when we should route sound out: enabled, a device exists, the
+        file has audio, and volume is audible."""
+        return (self.audio_on and self.volume > 0.001
+                and _AUDIO_FMT is not None and self._probe_has_audio(path))
+
+    def _audio_filter(self, spd):
+        """Build the ffmpeg -af chain: tempo-match to playback speed (atempo is
+        limited to 0.5–2.0, so chain it) then apply the volume gain."""
+        chain = []
+        s = spd if (spd and spd > 0) else 1.0
+        while s > 2.0 + 1e-6:
+            chain.append('atempo=2.0'); s /= 2.0
+        while s < 0.5 - 1e-6:
+            chain.append('atempo=0.5'); s *= 2.0
+        if abs(s - 1.0) > 1e-6:
+            chain.append(f'atempo={s:.4f}')
+        if abs(self.volume - 1.0) > 1e-6:
+            chain.append(f'volume={self.volume:.3f}')
+        return ','.join(chain)
 
     def notify_displayed(self):
         """Called by the UI after it paints a frame — frees the in-flight slot."""
@@ -1193,8 +1279,19 @@ class VideoWorker(QThread):
         if use_gpu:
             cmd += ['-hwaccel', 'vaapi', '-hwaccel_device', _VAAPI_NODE,
                     '-hwaccel_output_format', 'vaapi']
-        cmd += ['-i', tmp_path, '-vf', vf, '-an',
-                '-f', 'rawvideo', '-pix_fmt', 'nv12', '-']
+        cmd += ['-i', tmp_path]
+        # Video → stdout (raw NV12), consumed by the frame reader.
+        cmd += ['-map', '0:v:0', '-vf', vf,
+                '-f', 'rawvideo', '-pix_fmt', 'nv12', 'pipe:1']
+        # Audio → PulseAudio/ALSA, tempo-matched to the playback speed so it
+        # stays in sync with the -readrate-paced video. One ffmpeg = one clock,
+        # and stalling the video pipe (pause) naturally stalls audio too.
+        if self._audio_active(tmp_path):
+            af = self._audio_filter(spd)
+            cmd += ['-map', '0:a:0']
+            if af:
+                cmd += ['-af', af]
+            cmd += ['-ac', '2', '-f', _AUDIO_FMT, _AUDIO_TARGET]
         return cmd, use_gpu
 
     def local_seek(self, offset_s):
@@ -1228,7 +1325,10 @@ class VideoWorker(QThread):
                             f'NV12+cv2, speed={self.speed}×, -ss={seek_off:.0f}s)')
 
             stdout = self._proc.stdout
-            base_frames = int(seek_off * self.fps)
+            # Absolute position = file's start-within-recording (_file_base_offset_s)
+            # + in-file seek + frames played. Emitted position must be absolute so
+            # the progress bar is right even when the file starts mid-recording.
+            base_frames = int((seek_off + self._file_base_offset_s) * self.fps)
             frame_counter = 0
 
             relaunch = False
@@ -1919,6 +2019,8 @@ class VideoCell(QFrame):
         self.nvr = nvr
         self.worker = None
         self._streaming = False
+        self._audio_on = False   # live audio for this cell (managed by LiveViewTab)
+        self._volume   = 1.0
 
         self.setFrameShape(QFrame.Box)
         self.setStyleSheet(f'QFrame {{ background: #0d1117; border: 1px solid #21262d; border-radius: 4px; }}')
@@ -2038,9 +2140,23 @@ class VideoCell(QFrame):
                   f'{url.replace(self.nvr.password, "***")}  decode={dw}x{dh}')
             self.worker = VideoWorker(self.channel_id, url, decode_w=dw, decode_h=dh)
 
+        # Apply this cell's live-audio state before the stream starts so sound
+        # comes on with the first frame (only the selected cell is ever audio-on).
+        self.worker.set_audio(self._audio_on)
+        self.worker.set_volume(self._volume)
         self.worker.frame_ready.connect(self._on_frame, Qt.QueuedConnection)
         self.worker.error.connect(self._on_error)
         self.worker.start()
+
+    def apply_audio(self, on, volume):
+        """Set live audio for this cell (LiveViewTab enables only the selected
+        camera). Applies immediately to a running worker; PlayM4 toggles sound
+        without restarting the stream."""
+        self._audio_on = bool(on)
+        self._volume   = max(0.0, min(1.0, float(volume)))
+        if self.worker is not None:
+            self.worker.set_audio(self._audio_on)
+            self.worker.set_volume(self._volume)
 
     def stop_stream(self):
         if self.worker:
@@ -2090,13 +2206,80 @@ class VideoCell(QFrame):
         self.placeholder.show()
         self.status_dot.setStyleSheet(f'color: {DARK["red"]}; font-size: 10px; border: none;')
 
+class LiveAudioPlayer:
+    """Plays ONE live camera's audio via a dedicated audio-only ffmpeg → Pulse.
+    Kept fully separate from the video pipeline (SDK/PlayM4 video is untouched):
+    Hikvision's own PlayM4 audio render stays silent under PipeWire, but the
+    camera's RTSP main stream carries the same audio track as the recordings, so
+    we pull just that. Only one camera plays at a time."""
+    def __init__(self):
+        self._proc   = None
+        self._lock   = threading.Lock()
+        self._url    = None
+        self._volume = 1.0
+
+    def _build_cmd(self, url):
+        cmd = ['ffmpeg', '-loglevel', 'error', '-nostdin',
+               '-rtsp_transport', 'tcp', '-fflags', 'nobuffer',
+               '-i', url, '-vn', '-map', '0:a:0?', '-ac', '2']
+        if abs(self._volume - 1.0) > 1e-6:
+            cmd += ['-af', f'volume={self._volume:.3f}']
+        cmd += ['-f', _AUDIO_FMT, _AUDIO_TARGET]
+        return cmd
+
+    def _stop_proc_locked(self):
+        if self._proc:
+            try: self._proc.terminate()
+            except Exception: pass
+            try: self._proc.wait(timeout=1)
+            except Exception:
+                try: self._proc.kill()
+                except Exception: pass
+            self._proc = None
+
+    def _relaunch_locked(self):
+        import subprocess as sp
+        self._stop_proc_locked()
+        if not self._url or _AUDIO_FMT is None:
+            return
+        try:
+            self._proc = sp.Popen(self._build_cmd(self._url),
+                                   stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            dlog('LIVE-AUDIO', f'ffmpeg started ({_AUDIO_FMT})')
+        except Exception as e:
+            print(f'[LiveAudio] start failed: {e}')
+            self._proc = None
+
+    def play(self, url):
+        with self._lock:
+            self._url = url
+            self._relaunch_locked()
+
+    def set_volume(self, v):
+        with self._lock:
+            self._volume = max(0.0, min(1.0, float(v)))
+            if self._proc and self._proc.poll() is None:
+                self._relaunch_locked()   # volume is baked into the filter
+
+    def stop(self):
+        with self._lock:
+            self._url = None
+            self._stop_proc_locked()
+
+
 # ── Live View Tab ──────────────────────────────────────────────────────────────
 class LiveViewTab(QWidget):
+    # Emitted from a background ffprobe thread → UI: (camera uid, has_audio)
+    _audio_probed = pyqtSignal(str, bool)
+
     def __init__(self, nvr: NVRClient, parent=None):
         super().__init__(parent)
         self.nvr = nvr
         self.cameras = []
         self.cells = {}
+        self._cam_audio = {}      # uid -> True/False (has audio); missing = unprobed
+        self._audio_probing = set()   # uids with an in-flight probe
+        self._audio_probed.connect(self._on_audio_probed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -2124,10 +2307,37 @@ class LiveViewTab(QWidget):
         self.ptz_box = self._build_ptz_controls()
         self.ptz_box.setVisible(False)
 
+        # ── Live audio (follows the selected camera; only one plays at a time) ──
+        # Audio comes from the camera's RTSP main stream via a separate ffmpeg,
+        # independent of the SDK/PlayM4 video pipeline.
+        self._live_audio_on = False
+        self._live_volume   = 1.0
+        self._audio_player   = LiveAudioPlayer()
+        self.btn_live_mute = QPushButton('🔇')
+        self.btn_live_mute.setFixedWidth(46)
+        self.btn_live_mute.setStyleSheet('font-size:20px;')
+        self.btn_live_mute.setToolTip('Listen to the selected camera')
+        self.btn_live_mute.clicked.connect(self._on_live_mute)
+        self.vol_live = QSlider(Qt.Horizontal)
+        self.vol_live.setRange(0, 100)
+        self.vol_live.setValue(100)
+        self.vol_live.setFixedWidth(90)
+        self.vol_live.setToolTip('Volume')
+        # Update the number live; relaunch the audio ffmpeg only on release/click.
+        self.vol_live.valueChanged.connect(self._on_live_volume_preview)
+        self.vol_live.sliderReleased.connect(self._on_live_volume_committed)
+        if _AUDIO_FMT is None:
+            self.btn_live_mute.setEnabled(False)
+            self.vol_live.setEnabled(False)
+            self.btn_live_mute.setToolTip('No audio output device available')
+
         toolbar.addWidget(self.btn_all)
         toolbar.addWidget(self.btn_stop)
         toolbar.addWidget(self.lbl_quality)
         toolbar.addStretch()
+        toolbar.addWidget(self.btn_live_mute)
+        toolbar.addWidget(self.vol_live)
+        toolbar.addSpacing(12)
         toolbar.addWidget(self.ptz_box)
         toolbar.addWidget(QLabel('Layout:'))
         toolbar.addWidget(self.grid_combo)
@@ -2201,6 +2411,11 @@ class LiveViewTab(QWidget):
         self.selected_cam_id = channel_id
         self.ptz_box.setVisible(bool(getattr(self.nvr, 'has_ptz', False)))
 
+        # Audio is OFF by default on EVERY camera — never carry it across a switch.
+        if channel_id != old_id and self._live_audio_on:
+            self._live_audio_on = False
+            self.btn_live_mute.setText('🔇')
+
         if self.grid_combo.currentIndex() == 0:
             self.relayout(0)
             new_cell = self.cells.get(channel_id)
@@ -2222,6 +2437,108 @@ class LiveViewTab(QWidget):
                         else None))
         else:
             self.relayout(self.grid_combo.currentIndex())
+        # Move live audio to the newly selected camera (silence the others).
+        self._probe_selected_audio()   # detect audio capability (async, cached)
+        self._apply_live_audio()
+
+    def _selected_rtsp_url(self):
+        sel = getattr(self, 'selected_cam_id', None)
+        cell = self.cells.get(sel) if sel else None
+        if cell is None:
+            return sel, None
+        try:
+            return sel, cell.nvr.rtsp_live_url(cell.real_channel, False)  # main stream
+        except Exception as e:
+            dlog('LIVE-AUDIO', f'no RTSP url: {e}')
+            return sel, None
+
+    def _probe_selected_audio(self):
+        """Detect whether the selected camera's stream carries audio (background
+        ffprobe, cached per camera) so we can disable the controls if it doesn't."""
+        if _AUDIO_FMT is None:
+            return
+        sel, url = self._selected_rtsp_url()
+        if not sel or not url or sel in self._cam_audio or sel in self._audio_probing:
+            self._update_audio_controls()
+            return
+
+        self._audio_probing.add(sel)
+
+        def _probe(uid=sel, u=url):
+            import subprocess as sp
+            has = True   # optimistic default if the probe itself fails
+            try:
+                r = sp.run(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
+                            '-select_streams', 'a', '-show_entries', 'stream=index',
+                            '-of', 'csv=p=0', u],
+                           capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    has = bool(r.stdout.strip())
+            except Exception as e:
+                dlog('LIVE-AUDIO', f'probe failed for {uid}: {e}')
+            self._audio_probed.emit(uid, has)
+        threading.Thread(target=_probe, daemon=True).start()
+
+    def _on_audio_probed(self, uid, has):
+        self._cam_audio[uid] = has
+        self._audio_probing.discard(uid)
+        dlog('LIVE-AUDIO', f'{uid}: {"has audio" if has else "NO audio"}')
+        if uid == getattr(self, 'selected_cam_id', None):
+            self._update_audio_controls()
+            self._apply_live_audio()   # re-evaluate playback now capability is known
+
+    def _update_audio_controls(self):
+        """Enable/disable the live-audio controls for the selected camera based on
+        the probed capability. A camera known to have no audio gets them greyed."""
+        if _AUDIO_FMT is None:
+            return
+        sel = getattr(self, 'selected_cam_id', None)
+        has = self._cam_audio.get(sel, None)   # None = still probing → stay enabled
+        no_audio = (has is False)
+        self.btn_live_mute.setEnabled(not no_audio)
+        self.vol_live.setEnabled(not no_audio)
+        if no_audio:
+            self.btn_live_mute.setText('🔇')
+            self.btn_live_mute.setToolTip('This camera has no audio')
+            self._audio_player.stop()   # nothing to play
+        else:
+            self.btn_live_mute.setText('🔊' if self._live_audio_on else '🔇')
+            self.btn_live_mute.setToolTip('Listen to the selected camera')
+
+    def _apply_live_audio(self):
+        """Play audio for the selected camera only (one stream at a time), or stop
+        it when muted / nothing selected. Uses the camera's RTSP main stream."""
+        self._update_audio_controls()
+        sel = getattr(self, 'selected_cam_id', None)
+        # Skip cameras known to have no audio.
+        if self._cam_audio.get(sel, None) is False:
+            self._audio_player.stop()
+            return
+        _, url = self._selected_rtsp_url()
+        if self._live_audio_on and url:
+            self._audio_player.set_volume(self._live_volume)
+            self._audio_player.play(url)
+            return
+        self._audio_player.stop()
+
+    def _on_live_mute(self):
+        self._live_audio_on = not self._live_audio_on
+        self.btn_live_mute.setText('🔊' if self._live_audio_on else '🔇')
+        name = getattr(self, 'selected_cam_id', None) or '?'
+        dlog('LIVE-AUDIO', f'{"on" if self._live_audio_on else "off"} (cam={name})')
+        self._probe_selected_audio()
+        self._apply_live_audio()
+
+    def _on_live_volume_preview(self, val):
+        self._live_volume = val / 100.0
+        if self._live_audio_on:
+            self.btn_live_mute.setText('🔊' if self._live_volume > 0 else '🔇')
+        # Commit immediately for click/keyboard (not held); drag commits on release.
+        if not self.vol_live.isSliderDown():
+            self._audio_player.set_volume(self._live_volume)
+
+    def _on_live_volume_committed(self):
+        self._audio_player.set_volume(self._live_volume)
 
     def _should_use_sub(self):
         """Sub-stream for multi-view (saves NVR bandwidth), main for 1×1."""
@@ -2326,13 +2643,52 @@ class LiveViewTab(QWidget):
         sub = self._should_use_sub()
         for cell in self.cells.values():
             cell.start_stream(sub)
+        self._apply_live_audio()
 
     def stop_all(self):
+        self._audio_player.stop()
         for cell in self.cells.values():
             cell.stop_stream()
 
 
 # ── Timeline Widget ────────────────────────────────────────────────────────────
+class BufferedSlider(QSlider):
+    """Progress slider that also paints a YouTube-style 'buffered' region:
+    the played part shows in the accent colour (styled sub-page), the part that
+    is downloaded-but-not-yet-played shows as a lighter track ahead of the
+    playhead, and the rest stays dark. Call set_buffered(0.0–1.0) to update."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._buffered = 0.0
+
+    def set_buffered(self, frac):
+        frac = max(0.0, min(1.0, float(frac)))
+        if abs(frac - self._buffered) > 0.001:
+            self._buffered = frac
+            self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)   # groove + played sub-page + handle
+        if self._buffered <= 0:
+            return
+        rng = self.maximum() - self.minimum()
+        played = (self.value() - self.minimum()) / rng if rng else 0.0
+        if self._buffered <= played:
+            return
+        w = self.width()
+        # 4px groove, vertically centred (matches the QSS groove style)
+        gy = self.height() // 2 - 2
+        x_from = int(played * w) + 8   # start just past the handle
+        x_to   = int(self._buffered * w)
+        if x_to <= x_from:
+            return
+        p = QPainter(self)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 60))   # subtle light track
+        p.drawRoundedRect(QRectF(x_from, gy, x_to - x_from, 4), 2, 2)
+        p.end()
+
+
 class TimelineWidget(QWidget):
     """
     iVMS-style timeline:
@@ -2667,7 +3023,7 @@ class PlaybackTab(QWidget):
         self.pos_label.setStyleSheet(f'color:{DARK["dim"]};font-family:monospace;font-size:11px;min-width:40px;')
         self.dur_label = QLabel('00:00')
         self.dur_label.setStyleSheet(f'color:{DARK["dim"]};font-family:monospace;font-size:11px;min-width:40px;')
-        self.prog_slider = QSlider(Qt.Horizontal)
+        self.prog_slider = BufferedSlider(Qt.Horizontal)
         self.prog_slider.setRange(0, 1000)
         self.prog_slider.setValue(0)
         self.prog_slider.setEnabled(False)
@@ -2700,10 +3056,35 @@ class PlaybackTab(QWidget):
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         self._speeds = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 
+        # ── Audio: mute toggle + volume slider (persisted across recordings) ──
+        # Audio is OFF by default; the user turns it on per playback.
+        self._audio_on = False
+        self._volume   = 1.0
+        self.btn_mute = QPushButton('🔇')
+        self.btn_mute.setFixedWidth(46)
+        self.btn_mute.setStyleSheet('font-size:20px;')
+        self.btn_mute.setToolTip('Mute / unmute')
+        self.btn_mute.clicked.connect(self._on_mute_toggled)
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(100)
+        self.vol_slider.setFixedWidth(90)
+        self.vol_slider.setToolTip('Volume')
+        # Live-preview the gain while dragging; relaunch ffmpeg on release.
+        self.vol_slider.valueChanged.connect(self._on_volume_preview)
+        self.vol_slider.sliderReleased.connect(self._on_volume_committed)
+        if _AUDIO_FMT is None:
+            self.btn_mute.setEnabled(False)
+            self.vol_slider.setEnabled(False)
+            self.btn_mute.setToolTip('No audio output device available')
+
         pb_ctrl.addWidget(self.btn_play)
         pb_ctrl.addWidget(self.btn_pause)
         pb_ctrl.addWidget(self.btn_stop_pb)
         pb_ctrl.addStretch()
+        pb_ctrl.addWidget(self.btn_mute)
+        pb_ctrl.addWidget(self.vol_slider)
+        pb_ctrl.addSpacing(12)
         pb_ctrl.addWidget(QLabel('Speed:'))
         pb_ctrl.addWidget(self.speed_combo)
         right.addLayout(pb_ctrl)
@@ -2807,16 +3188,19 @@ class PlaybackTab(QWidget):
         if (idx == getattr(self, '_current_rec_idx', -1) and w
                 and getattr(w, '_tmp_file', None)
                 and os.path.exists(w._tmp_file)):
-            # Estimate how many seconds are downloaded so far. Full recording is
-            # _rec_dur_s; file grows roughly linearly. Use the complete flag, or a
-            # byte-ratio estimate, to decide if the seek target is available.
-            if getattr(w, '_dl_complete', False):
+            # The file covers [file_base, file_base + downloaded]. A seek before
+            # file_base (the file's start within the recording) needs a fresh
+            # download from the new point; otherwise reuse the local file.
+            file_base = getattr(w, '_file_base_offset_s', 0.0)
+            if offset < file_base:
+                can_local = False
+            elif getattr(w, '_dl_complete', False):
                 can_local = True
             else:
-                # Use the SDK download percentage to estimate available seconds.
+                # SDK download % is of the remaining span (file_base → end).
                 pct = getattr(w, '_dl_percent', 0)
-                rec_dur = max(1.0, self._rec_dur_s)
-                downloaded_s = rec_dur * (pct / 100.0)
+                remaining = max(1.0, self._rec_dur_s - file_base)
+                downloaded_s = file_base + remaining * (pct / 100.0)
                 if offset < downloaded_s - 3:
                     can_local = True
 
@@ -2873,6 +3257,7 @@ class PlaybackTab(QWidget):
 
         self._fmt_duration(self._rec_dur_s)
         self.prog_slider.setValue(0)
+        self.prog_slider.set_buffered(0.0)
 
         # uid is 'deviceid_origchannel'; extract real channel for NVR lookup
         real_cam_id = cam_id.split('_', 1)[-1] if '_' in cam_id else cam_id
@@ -2883,23 +3268,31 @@ class PlaybackTab(QWidget):
         # SDK is preferred for playback — avoids RTSP bandwidth (453) errors entirely
         if _SDK and nvr.sdk_user_id >= 0:
             rec_end_dt = self._rec_start_dt + timedelta(seconds=self._rec_dur_s)
-            # Download the FULL recording (true start → end). ffmpeg then seeks to
-            # the requested offset within the local file via -ss. This way, later
-            # seeks within the SAME recording reuse the file (no re-download).
+            # iVMS-style seek: when seeking, START the SDK download AT the seek
+            # point (not the recording's beginning). The file then begins at the
+            # seek offset, so playback starts almost immediately (only a small
+            # prebuffer to download) instead of waiting for the download to reach
+            # the middle. _file_base_offset_s records where the file starts within
+            # the recording, so position + later local seeks stay correct.
+            dl_start_dt = self._rec_start_dt
+            file_base   = 0.0
+            if seek_offset_s > 0:
+                dl_start_dt = self._rec_start_dt + timedelta(seconds=seek_offset_s)
+                file_base   = seek_offset_s
             dlog('Playback', f'SDK NVR={nvr.host}  ch={real_cam_id}  '
-                  f'{self._rec_start_dt:%H:%M:%S}→{rec_end_dt:%H:%M:%S}'
-                  f'{"  (ffmpeg -ss +%ds)" % int(seek_offset_s) if seek_offset_s > 0 else ""}')
+                  f'{dl_start_dt:%H:%M:%S}→{rec_end_dt:%H:%M:%S}'
+                  f'{"  (from seek +%ds)" % int(seek_offset_s) if seek_offset_s > 0 else ""}')
             self.worker = VideoWorker(
                 'playback', '', speed=spd, decode_w=1280, decode_h=720,
                 sdk_source={
                     'nvr': nvr, 'channel': real_cam_id, 'mode': 'playback',
-                    'start_dt': self._rec_start_dt,   # full recording
+                    'start_dt': dl_start_dt,          # download begins at seek point
                     'end_dt':   rec_end_dt,
-                    'seek_offset_s': seek_offset_s,   # ffmpeg -ss into the file
+                    'seek_offset_s': 0.0,             # file already starts here → no -ss
                     'wait_for': getattr(self, '_stopping', None),
                 }
             )
-            self.worker._file_base_offset_s = 0.0   # file begins at recording start
+            self.worker._file_base_offset_s = file_base   # file starts at this offset
         else:
             # RTSP fallback (uses URI from ISAPI if present, else compact format)
             uri = rec.get('uri', '')
@@ -2918,6 +3311,7 @@ class PlaybackTab(QWidget):
                             f'?starttime={_compact(rec["start"])}&endtime={_compact(rec["end"])}')
             print(f'[Playback RTSP fallback] {rtsp_url.replace(nvr.password, "***")}')
             self.worker = VideoWorker('playback', rtsp_url, speed=spd)
+        self._apply_audio_to_worker(self.worker)
         self.worker.frame_ready.connect(self._on_frame, Qt.QueuedConnection)
         self.worker.error.connect(self._on_pb_error)
         self.worker.position_ms.connect(self._on_position, Qt.QueuedConnection)
@@ -2982,6 +3376,13 @@ class PlaybackTab(QWidget):
         if not self._paused:
             spd = self._speeds[self.speed_combo.currentIndex()]
             self._elapsed_s += spd
+        # YouTube-style buffered track: how much of the recording is downloaded.
+        w = self.worker
+        if w is not None:
+            if getattr(w, '_dl_complete', False):
+                self.prog_slider.set_buffered(1.0)
+            elif getattr(w, '_tmp_file', None):
+                self.prog_slider.set_buffered(getattr(w, '_dl_percent', 0) / 100.0)
         self._update_progress_ui()
 
     def _update_progress_ui(self):
@@ -3027,17 +3428,86 @@ class PlaybackTab(QWidget):
             self.btn_pause.setText('Resume')
             self.timer.stop()
 
+    def _can_local_relaunch(self, cur_offset):
+        """True when the current worker can relaunch ffmpeg on its already-
+        downloaded file at cur_offset without a fresh SDK download. A brand-new
+        download only has a ~2 MB prebuffer, so ffmpeg -ss to a mid-recording
+        offset would land past EOF and freeze — reuse the local file instead."""
+        w = self.worker
+        if not (w and getattr(w, '_tmp_file', None) and os.path.exists(w._tmp_file)):
+            return False
+        file_base = getattr(w, '_file_base_offset_s', 0.0)
+        if cur_offset < file_base:
+            return False
+        if getattr(w, '_dl_complete', False):
+            return True
+        pct = getattr(w, '_dl_percent', 0)
+        remaining = max(1.0, self._rec_dur_s - file_base)
+        downloaded_s = file_base + remaining * (pct / 100.0)
+        return cur_offset < downloaded_s - 3
+
+    def _local_seek_current(self, cur_offset):
+        """Relaunch ffmpeg on the local file at cur_offset (no re-download)."""
+        w = self.worker
+        file_base = getattr(w, '_file_base_offset_s', 0.0)
+        w.local_seek(max(0.0, cur_offset - file_base))
+
     def _on_speed_changed(self, idx):
         # Playback uses ffmpeg -readrate for speed, set at launch. Changing speed
-        # restarts playback from the CURRENT position at the new rate.
+        # relaunches ffmpeg at the CURRENT position with the new rate.
         target = self._speeds[idx]
         row = self.rec_list.currentRow()
         if row < 0 or not self.worker:
             return
-        # Resume from where we are now (elapsed seconds within the recording)
-        cur_offset = max(0.0, self._elapsed_s)
-        dlog('SPEED', f'→ {target}× from offset {cur_offset:.0f}s')
+        cur_offset = max(0.0, self._elapsed_s)   # resume from here
+        if self._can_local_relaunch(cur_offset):
+            dlog('SPEED', f'→ {target}× from offset {cur_offset:.0f}s (local, no re-download)')
+            self.worker.set_speed(target)
+            self._local_seek_current(cur_offset)
+            return
+        dlog('SPEED', f'→ {target}× from offset {cur_offset:.0f}s (re-download)')
         self._play_recording(row, seek_offset_s=cur_offset, speed_override=target)
+
+    def _apply_audio_to_worker(self, w):
+        if w is not None:
+            w.set_audio(self._audio_on)
+            w.set_volume(self._volume)
+
+    def _relaunch_audio(self):
+        """Apply the current mute/volume to live playback. Audio routing is baked
+        into the ffmpeg command, so relaunch it at the current position — locally
+        (no re-download) when the file is available, else restart the recording."""
+        w = self.worker
+        if w is None:
+            return
+        self._apply_audio_to_worker(w)
+        cur_offset = max(0.0, self._elapsed_s)
+        if self._can_local_relaunch(cur_offset):
+            self._local_seek_current(cur_offset)
+        else:
+            row = self.rec_list.currentRow()
+            if row >= 0:
+                self._play_recording(row, seek_offset_s=cur_offset)
+
+    def _on_mute_toggled(self):
+        self._audio_on = not self._audio_on
+        on = self._audio_on and self._volume > 0
+        self.btn_mute.setText('🔊' if on else '🔇')
+        dlog('AUDIO', f'{"unmuted" if self._audio_on else "muted"}')
+        self._relaunch_audio()
+
+    def _on_volume_preview(self, val):
+        # Fires continuously while dragging: update gain + icon, but don't
+        # relaunch mid-drag (only on release / click, see _on_volume_committed).
+        self._volume = val / 100.0
+        if self._audio_on:
+            self.btn_mute.setText('🔊' if self._volume > 0 else '🔇')
+        if not self.vol_slider.isSliderDown():
+            self._relaunch_audio()
+
+    def _on_volume_committed(self):
+        dlog('AUDIO', f'volume → {int(self._volume * 100)}%')
+        self._relaunch_audio()
 
     def stop_playback(self):
         """Stop current playback. Worker shutdown runs on a background thread so
@@ -3057,6 +3527,7 @@ class PlaybackTab(QWidget):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText('Pause')
         self.prog_slider.setValue(0)
+        self.prog_slider.set_buffered(0.0)
         self.pos_label.setText('00:00')
         self.video_label.setText('Select a recording to play')
         self.video_label.clear_frame()
@@ -3953,6 +4424,12 @@ class MainWindow(QMainWindow):
                 cell.stop_stream()
                 QTimer.singleShot(300, lambda c=cell: c.start_stream(
                     self.live_tab._should_use_sub()))
+
+    def closeEvent(self, e):
+        # Stop the live-audio ffmpeg so it doesn't linger after the app quits.
+        try: self.live_tab._audio_player.stop()
+        except Exception: pass
+        super().closeEvent(e)
 
 
 # ── Drag-enabled camera list ───────────────────────────────────────────────────
