@@ -5,7 +5,7 @@ DS-7604NI-K1/4P kompatibilan
 ISAPI za upravljanje + OpenCV za RTSP video
 """
 
-import sys, os, json, threading, time, queue
+import sys, os, json, threading, time, queue, webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -2988,11 +2988,24 @@ class PlaybackTab(QWidget):
         left.addWidget(self.rec_list)
         left.setStretch(2, 1)
 
-        main.addLayout(left, 1)
+        self.pb_left_panel = QWidget()
+        self.pb_left_panel.setLayout(left)
 
         # ── Desno: video + timeline + controls ───────────────
         right = QVBoxLayout()
         right.setSpacing(8)
+
+        # Collapse toggle for the search panel — one click hides the whole
+        # recordings list to widen the video (the splitter also drags it).
+        pb_hdr = QHBoxLayout()
+        self.btn_pb_panel = QPushButton('◀')
+        self.btn_pb_panel.setToolTip('Hide the search panel (widen video)')
+        self.btn_pb_panel.setFixedSize(26, 22)
+        self.btn_pb_panel.setStyleSheet('font-size:13px;font-weight:700;padding:0;')
+        self.btn_pb_panel.clicked.connect(self._toggle_pb_panel)
+        pb_hdr.addWidget(self.btn_pb_panel)
+        pb_hdr.addStretch()
+        right.addLayout(pb_hdr)
 
         self.video_label = ZoomableVideoLabel('Select a recording to play')
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -3089,13 +3102,35 @@ class PlaybackTab(QWidget):
         pb_ctrl.addWidget(self.speed_combo)
         right.addLayout(pb_ctrl)
 
-        main.addLayout(right, 3)
+        right_panel = QWidget()
+        right_panel.setLayout(right)
+
+        # Draggable divider: shrink/hide the search panel to widen the video.
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.pb_left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, False)
+        splitter.setHandleWidth(6)
+        splitter.setSizes([300, 900])
+        self.pb_splitter = splitter
+        main.addWidget(splitter)
 
         # Timer za progress (svaka sekunda)
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick_progress)
         self._elapsed_s = 0.0
         self.fps = 25.0
+
+    def _toggle_pb_panel(self):
+        show = self.pb_left_panel.isHidden()
+        self.pb_left_panel.setVisible(show)
+        self.btn_pb_panel.setText('◀' if show else '▶')
+        self.btn_pb_panel.setToolTip(
+            'Hide the search panel (widen video)' if show
+            else 'Show the search panel')
 
     def set_cameras(self, cameras, nvr_map=None):
         self.cameras  = cameras
@@ -3474,9 +3509,11 @@ class PlaybackTab(QWidget):
             w.set_volume(self._volume)
 
     def _relaunch_audio(self):
-        """Apply the current mute/volume to live playback. Audio routing is baked
-        into the ffmpeg command, so relaunch it at the current position — locally
-        (no re-download) when the file is available, else restart the recording."""
+        """Apply the current mute/volume to playback. Audio routing is baked into
+        the ffmpeg command at launch, so the worker's audio flags (set below) are
+        picked up automatically the next time ffmpeg starts. When playback is
+        already running on a local file, relaunch ffmpeg locally (no re-download)
+        so the change takes effect immediately."""
         w = self.worker
         if w is None:
             return
@@ -3484,10 +3521,15 @@ class PlaybackTab(QWidget):
         cur_offset = max(0.0, self._elapsed_s)
         if self._can_local_relaunch(cur_offset):
             self._local_seek_current(cur_offset)
-        else:
+        elif getattr(w, 'sdk_source', None) is None:
+            # RTSP-fallback playback (no local download file): a relaunch is the
+            # only way to apply audio, and there is no SDK download to collide with.
             row = self.rec_list.currentRow()
             if row >= 0:
                 self._play_recording(row, seek_offset_s=cur_offset)
+        # else: an SDK download is still buffering. The flags set above take
+        # effect when its ffmpeg launches — starting a fresh download here would
+        # race the in-flight one (0KB files) and previously crashed the app.
 
     def _on_mute_toggled(self):
         self._audio_on = not self._audio_on
@@ -4027,9 +4069,18 @@ class MainWindow(QMainWindow):
         sb.setContentsMargins(10,14,10,14)
         sb.setSpacing(6)
 
+        logo_row = QHBoxLayout()
         logo = QLabel('📹  HIK MONITOR')
         logo.setStyleSheet(f'color:{DARK["accent"]};font-size:15px;font-weight:700;letter-spacing:1px;')
-        sb.addWidget(logo)
+        btn_collapse = QPushButton('«')
+        btn_collapse.setToolTip('Collapse sidebar (mini mode)')
+        btn_collapse.setFixedSize(26, 24)
+        btn_collapse.setStyleSheet('font-size:16px;font-weight:700;padding:0;')
+        btn_collapse.clicked.connect(lambda: self._set_sidebar_mini(True))
+        logo_row.addWidget(logo)
+        logo_row.addStretch()
+        logo_row.addWidget(btn_collapse)
+        sb.addLayout(logo_row)
 
         # Devices section
         dev_hdr = QHBoxLayout()
@@ -4094,7 +4145,61 @@ class MainWindow(QMainWindow):
         )
         sb.addWidget(kofi)
 
+        self.sidebar = sidebar
         root.addWidget(sidebar)
+
+        # Mini rail — the sidebar collapsed to a thin strip. Just an expand
+        # button plus miniature support icons, so the video area gets almost the
+        # full window width. Only one of {sidebar, mini_rail} is visible at once.
+        self.mini_rail = QWidget()
+        self.mini_rail.setFixedWidth(46)
+        self.mini_rail.setStyleSheet(
+            f'background:{DARK["panel"]};border-right:1px solid {DARK["border"]};')
+        mr = QVBoxLayout(self.mini_rail)
+        mr.setContentsMargins(6, 14, 6, 14)
+        mr.setSpacing(8)
+        btn_expand = QPushButton('☰')
+        btn_expand.setToolTip('Expand sidebar')
+        btn_expand.setFixedSize(34, 30)
+        btn_expand.setStyleSheet('font-size:16px;font-weight:700;padding:0;')
+        btn_expand.clicked.connect(lambda: self._set_sidebar_mini(False))
+        mr.addWidget(btn_expand, alignment=Qt.AlignHCenter)
+
+        # Camera shortcuts — compact per-camera buttons so cameras can be
+        # switched without expanding the sidebar (📷 + first letters; full name
+        # in the tooltip). Scrolls when there are more cameras than fit.
+        cam_scroll = QScrollArea()
+        cam_scroll.setWidgetResizable(True)
+        cam_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cam_scroll.setFrameShape(QFrame.NoFrame)
+        cam_scroll.setStyleSheet('background:transparent;')
+        cam_host = QWidget()
+        self._mini_cam_box = QVBoxLayout(cam_host)
+        self._mini_cam_box.setContentsMargins(0, 0, 0, 0)
+        self._mini_cam_box.setSpacing(5)
+        self._mini_cam_box.addStretch()
+        cam_scroll.setWidget(cam_host)
+        mr.addWidget(cam_scroll, 1)
+
+        mini_coffee = QPushButton('☕')
+        mini_coffee.setToolTip('Support development — Buy me a coffee')
+        mini_coffee.setFixedSize(34, 30)
+        mini_coffee.setStyleSheet(
+            'background:#FFDD00;color:#0d1117;border-radius:6px;font-size:15px;padding:0;')
+        mini_coffee.clicked.connect(
+            lambda: webbrowser.open('https://buymeacoffee.com/manutdsnake'))
+        mr.addWidget(mini_coffee, alignment=Qt.AlignHCenter)
+        mini_kofi = QPushButton('❤')
+        mini_kofi.setToolTip('Support development — Ko-fi')
+        mini_kofi.setFixedSize(34, 30)
+        mini_kofi.setStyleSheet(
+            'background:#FF5E5B;color:white;border-radius:6px;font-size:14px;padding:0;')
+        mini_kofi.clicked.connect(lambda: webbrowser.open('https://ko-fi.com/manutdsnake'))
+        mr.addWidget(mini_kofi, alignment=Qt.AlignHCenter)
+        self.mini_rail.hide()
+        root.addWidget(self.mini_rail)
+
+        self._sidebar_mini = False   # user's manual collapse preference
 
         # Main tabs
         self.tabs = QTabWidget()
@@ -4103,6 +4208,10 @@ class MainWindow(QMainWindow):
         self.pb_tab._live_tab_ref = self.live_tab
         self.tabs.addTab(self.live_tab, '  Live View  ')
         self.tabs.addTab(self.pb_tab,   '  Playback  ')
+        # Playback has its own camera picker; the sidebar's camera list would
+        # switch back to Live View and confuse users — so hide the whole menu on
+        # Playback and restore it (full or mini) when returning to Live View.
+        self.tabs.currentChanged.connect(lambda _: self._update_sidebar_visibility())
         root.addWidget(self.tabs)
 
         self.status = QStatusBar()
@@ -4115,6 +4224,54 @@ class MainWindow(QMainWindow):
         ready = [d for d in self.devices if d.host]
         if ready:
             QTimer.singleShot(600, self._connect_all)
+
+    # ── Sidebar collapse / mini mode ───────────────────────────
+    def _set_sidebar_mini(self, mini):
+        """Remember the user's collapse choice and apply it (unless Playback is
+        currently forcing the menu hidden)."""
+        self._sidebar_mini = bool(mini)
+        self._update_sidebar_visibility()
+
+    def _update_sidebar_visibility(self):
+        on_playback = (self.tabs.currentWidget() is self.pb_tab)
+        if on_playback:
+            self.sidebar.hide()
+            self.mini_rail.hide()
+        elif self._sidebar_mini:
+            self.sidebar.hide()
+            self.mini_rail.show()
+        else:
+            self.sidebar.show()
+            self.mini_rail.hide()
+
+    def _refresh_mini_cameras(self):
+        """Rebuild the mini rail's per-camera shortcut buttons from the current
+        camera list, so the collapsed sidebar can still switch cameras."""
+        box = self._mini_cam_box
+        while box.count():                    # clear old buttons + trailing stretch
+            item = box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for cam in self._all_cameras:
+            uid  = cam.get('uid', cam['id'])
+            name = cam.get('name', '?')
+            btn  = QPushButton(f'📷\n{name[:3]}')
+            btn.setToolTip(name)
+            btn.setFixedSize(34, 40)
+            btn.setStyleSheet(
+                f'font-size:11px;padding:0;color:{DARK["green"]};')
+            btn.clicked.connect(lambda _=False, u=uid: self._mini_select_camera(u))
+            box.addWidget(btn, alignment=Qt.AlignHCenter)
+        box.addStretch()
+
+    def _mini_select_camera(self, uid):
+        """Same as clicking a camera in the full list: select it on Live View."""
+        nvr = self._nvr_map.get(uid)
+        if nvr:
+            self.live_tab.nvr = nvr
+        self.live_tab.select_camera(uid)
+        self.tabs.setCurrentIndex(0)   # make sure we're on Live View
 
     # ── Devices ────────────────────────────────────────────────
     def _refresh_device_list(self):
@@ -4340,6 +4497,7 @@ class MainWindow(QMainWindow):
         live_cams = [{**c, 'id': c.get('uid', c['id'])} for c in self._all_cameras]
         self.live_tab.set_cameras(live_cams)
         self.pb_tab.set_cameras(live_cams, self._nvr_map)
+        self._refresh_mini_cameras()
 
     def _cam_clicked(self, item, column=0):
         uid = item.data(0, Qt.UserRole)
@@ -4478,6 +4636,18 @@ if __name__ == '__main__':
     if DEBUG:
         log('APP', 'Debug logging ON (HIK_DEBUG=1). Stats every 3s.')
     _STATS.start()
+    # PyQt5 calls qFatal() → abort() on any unhandled exception raised inside a
+    # slot (e.g. a button click), which kills the whole process. Route unhandled
+    # exceptions through a hook that logs the traceback and keeps the app alive.
+    import traceback
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log('ERROR', 'Unhandled exception (app kept alive):\n' +
+            ''.join(traceback.format_exception(exc_type, exc_value, exc_tb)).rstrip())
+    sys.excepthook = _excepthook
+
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     app.setStyle('Fusion')
