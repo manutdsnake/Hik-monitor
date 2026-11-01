@@ -2283,7 +2283,10 @@ class VideoCell(QFrame):
                 dlog('Cloud', f'{self.name}: preview failed: {e}')
                 return
             if jpg:
-                self._preview_ready.emit(worker, jpg)
+                try:
+                    self._preview_ready.emit(worker, jpg)
+                except RuntimeError:     # cell deleted meanwhile
+                    pass
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_preview(self, worker, jpg):
@@ -2297,7 +2300,33 @@ class VideoCell(QFrame):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            self._press_pos = e.pos()
             self.clicked.emit(self.channel_id)
+
+    def mouseMoveEvent(self, e):
+        # Drag this cell's camera onto another grid cell (swap / move there).
+        # Zoomed video keeps the drag for panning (the label accepts it).
+        pp = getattr(self, '_press_pos', None)
+        if (pp is not None and e.buttons() & Qt.LeftButton
+                and (e.pos() - pp).manhattanLength() >= QApplication.startDragDistance()):
+            self._press_pos = None
+            from PyQt5.QtCore import QMimeData
+            from PyQt5.QtGui import QDrag
+            mime = QMimeData()
+            mime.setText(self.channel_id)
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            pm = self.grab()
+            if not pm.isNull():
+                drag.setPixmap(pm.scaled(200, 112, Qt.KeepAspectRatio,
+                                         Qt.SmoothTransformation))
+            drag.exec_(Qt.CopyAction | Qt.MoveAction)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._press_pos = None
+        super().mouseReleaseEvent(e)
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -2342,6 +2371,7 @@ class VideoCell(QFrame):
         self.placeholder.show()
 
         self._streaming = True
+        self._sub = sub              # current quality (layout switch skips no-op restarts)
         self.status_dot.setStyleSheet(f'color: {DARK["amber"]}; font-size: 10px; border: none;')
         self.placeholder.setText(f'⏳\nConnecting...')
 
@@ -2509,15 +2539,41 @@ class LiveAudioPlayer:
 
 
 # ── Live View Tab ──────────────────────────────────────────────────────────────
+class EmptyGridSlot(QFrame):
+    """A free grid cell — drop a camera from the list (or another cell) here."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f'QFrame {{ background: #0d1117; border: 1px dashed '
+                           f'{DARK["border"]}; border-radius: 4px; }}')
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(320, 180)
+        lay = QVBoxLayout(self)
+        lbl = QLabel('＋\nDrag a camera here')
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet(f'color: {DARK["dim"]}; font-size: 12px; border: none;')
+        lay.addWidget(lbl)
+
+
 class LiveViewTab(QWidget):
     # Emitted from a background ffprobe thread → UI: (camera uid, has_audio)
     _audio_probed = pyqtSignal(str, bool)
+
+    _MAX_SLOTS = 16
+    # grid_combo index → number of slots shown ('1×1' shows the selection)
+    _SLOT_COUNTS = {1: 4, 2: 9, 3: 16, 4: 4, 5: 8}
 
     def __init__(self, nvr: NVRClient, parent=None):
         super().__init__(parent)
         self.nvr = nvr
         self.cameras = []
-        self.cells = {}
+        self.cells = {}           # uid → VideoCell, created on demand
+        # Grid slots: which camera sits in which cell of the grid. Cells are
+        # NOT reserved per camera — any camera can be dragged into any slot.
+        self.slots = [None] * self._MAX_SLOTS
+        self._empty_widgets = []  # placeholder per free slot ("drag here")
+        self._slot_at = {}        # placed widget → slot index (for drops)
+        self._placed_cells = []   # VideoCells on screen in the current layout
+        self._resume = set()      # uids playing before a layout switch
         self._cam_audio = {}      # uid -> True/False (has audio); missing = unprobed
         self._audio_probing = set()   # uids with an in-flight probe
         self._audio_probed.connect(self._on_audio_probed)
@@ -2629,30 +2685,50 @@ class LiveViewTab(QWidget):
             nvr.ptz_stop()
 
     def set_cameras(self, cameras):
+        """New camera list (called whenever any device connects/disconnects).
+        Keeps the grid arrangement and the running streams of cameras that are
+        still there; free slots get not-yet-placed cameras in list order (so a
+        fresh start still shows the first cameras, as before)."""
         self.cameras = cameras
-        self.stop_all()
-        self.cells.clear()
+        uids = [c['id'] for c in cameras]
+        known = set(uids)
+        gone = [self.cells.pop(u) for u in list(self.cells) if u not in known]
+        for cam in cameras:                       # camera dicts are rebuilt
+            cell = self.cells.get(cam['id'])
+            if cell is not None:
+                cell.nvr = cam.get('_nvr', cell.nvr)
+                if cam.get('name') and cam['name'] != cell.name:
+                    cell.name = cam['name']
+                    cell.name_label.setText(cell.name)
+        self.slots = [u if u in known else None for u in self.slots]
+        placed = {u for u in self.slots if u}
+        fresh = iter([u for u in uids if u not in placed])
+        self.slots = [u if u else next(fresh, None) for u in self.slots]
+        self._resume &= known
+        if getattr(self, 'selected_cam_id', None) not in known:
+            self.selected_cam_id = uids[0] if uids else None
+            if self._live_audio_on:
+                self._live_audio_on = False
+                self.btn_live_mute.setText('🔇')
+            self._audio_player.stop()
         self._update_quality_label()
-        self.selected_cam_id = cameras[0]['id'] if cameras else None
-        for cam in cameras[:16]:
-            nvr = cam.get('_nvr', self.nvr)
-            uid = cam['id']  # already uid after _refresh_camera_list transform
-            # Extract real channel id for RTSP (strip deviceid_ prefix)
-            real_ch = uid.split('_', 1)[-1] if '_' in uid else uid
-            cell = VideoCell(uid, cam['name'], nvr, real_channel=real_ch)
-            cell.clicked.connect(self.select_camera)
-            self.cells[uid] = cell
-        self.relayout(0)
+        self.relayout()
+        # Dispose cells of vanished cameras (the old code just cleared the dict
+        # and leaked the widgets, which stayed painted as "ghost" cells).
+        for cell in gone:
+            cell.stop_stream()
+            cell.hide()
+            cell.deleteLater()
+
+    def _camera(self, uid):
+        return next((c for c in self.cameras if c.get('id') == uid), None)
 
     def _ensure_cell(self, uid):
-        """Cells are pre-built only for the first 16 cameras (the largest grid).
-        Any later camera — e.g. a Hik-Connect account's 2nd NVR when local
-        devices come first — gets its cell on demand when selected/dropped;
-        before, selecting it silently showed camera #1 and started nothing."""
+        """VideoCell for a camera, created the first time it is shown."""
         cell = self.cells.get(uid)
         if cell is not None or not uid:
             return cell
-        cam = next((c for c in getattr(self, 'cameras', []) if c.get('id') == uid), None)
+        cam = self._camera(uid)
         if cam is None:
             return None
         real_ch = uid.split('_', 1)[-1] if '_' in uid else uid
@@ -2665,12 +2741,41 @@ class LiveViewTab(QWidget):
         self.cells[uid] = cell
         return cell
 
-    def select_camera(self, channel_id):
+    def _empty_slot(self, i):
+        while len(self._empty_widgets) <= i:
+            w = EmptyGridSlot(self.grid_widget)
+            w.hide()
+            self._empty_widgets.append(w)
+        return self._empty_widgets[i]
+
+    def _visible_slots(self):
+        return self._SLOT_COUNTS.get(self.grid_combo.currentIndex(), 0)
+
+    def _place(self, slot, uid):
+        """Put camera `uid` into grid slot `slot`. If it already sits in another
+        slot the two swap; a camera pushed off screen is stopped (no hidden
+        streams eating bandwidth / cloud sessions)."""
+        old = self.slots[slot]
+        if old == uid:
+            return
+        if uid in self.slots:
+            self.slots[self.slots.index(uid)] = old
+        self.slots[slot] = uid
+        if old and old not in self.slots[:self._visible_slots()]:
+            cell = self.cells.get(old)
+            if cell is not None and cell._streaming:
+                cell.stop_stream()
+
+    def select_camera(self, channel_id, promote=True):
         """Select camera for 1×1 view. To avoid a slow gap while the old worker
         dies, we START the new camera first, then stop the old one a moment later
-        (overlap). This makes switching feel instant."""
+        (overlap). This makes switching feel instant.
+        In 1+3 / 1+7 the selected camera goes to the big cell (promote)."""
         old_id = getattr(self, 'selected_cam_id', None)
         self.selected_cam_id = channel_id
+        cam = self._camera(channel_id)
+        if cam is not None and cam.get('_nvr') is not None:
+            self.nvr = cam['_nvr']            # PTZ etc. follow the selection
         self._ensure_cell(channel_id)
         self.ptz_box.setVisible(bool(getattr(self.nvr, 'has_ptz', False)))
 
@@ -2699,6 +2804,8 @@ class LiveViewTab(QWidget):
                         c.stop_stream() if c is not self.cells.get(self.selected_cam_id)
                         else None))
         else:
+            if promote and cam is not None and self.grid_combo.currentIndex() in (4, 5):
+                self._place(0, channel_id)
             self.relayout(self.grid_combo.currentIndex())
         # Move live audio to the newly selected camera (silence the others).
         self._probe_selected_audio()   # detect audio capability (async, cached)
@@ -2812,108 +2919,126 @@ class LiveViewTab(QWidget):
         self.lbl_quality.setText(f'Quality: {"sub (low)" if sub else "main (HD)"}')
 
     def _on_grid_changed(self, idx):
-        """Restart active streams when grid changes to apply new quality."""
+        """Apply the new layout with the right quality: on-screen streams are
+        (re)started, streams that left the screen are stopped, and cameras that
+        were playing before come back (grid → 1×1 → grid restarts the grid)."""
         self._update_quality_label()
+        self._resume |= {u for u, c in self.cells.items() if c._streaming}
         self.relayout(idx)
-        # Restart any active streams with appropriate quality
         sub = self._should_use_sub()
-        for cell in self.cells.values():
-            if cell._streaming:
+        on_screen = self._placed_cells
+        for uid, cell in list(self.cells.items()):
+            if cell in on_screen:
+                if cell._streaming and getattr(cell, '_sub', None) == sub:
+                    continue                 # already the right quality
+                if cell._streaming or uid in self._resume:
+                    if cell._streaming:
+                        cell.stop_stream()
+                    # Tiny delay between stop/start to let NVR release the session
+                    QTimer.singleShot(300, lambda c=cell, s=sub: c.start_stream(s))
+            elif cell._streaming:
                 cell.stop_stream()
-                # Tiny delay between stop/start to let NVR release the session
-                QTimer.singleShot(300, lambda c=cell, s=sub: c.start_stream(s))
+
+    @staticmethod
+    def _slot_pos(mode, i):
+        """Grid position (row, col, rowspan, colspan) of slot i in a layout."""
+        if mode == 1:
+            return (i // 2, i % 2, 1, 1)
+        if mode == 2:
+            return (i // 3, i % 3, 1, 1)
+        if mode == 3:
+            return (i // 4, i % 4, 1, 1)
+        if mode == 4:                    # 1+3: big left (2/3), 3 stacked right
+            return (0, 0, 3, 2) if i == 0 else (i - 1, 2, 1, 1)
+        # 1+7 (as in iVMS): big 3×3 of a 4×4 grid, 3 down the right, 4 along
+        # the bottom. (The old 1+7 put 5 cells in the bottom row of a 3-wide grid.)
+        if i == 0:
+            return (0, 0, 3, 3)
+        return (i - 1, 3, 1, 1) if i <= 3 else (3, i - 4, 1, 1)
+
+    # grid_combo index → (rows, cols) of the underlying grid
+    _GRID_DIMS = {0: (1, 1), 1: (2, 2), 2: (3, 3), 3: (4, 4), 4: (3, 3), 5: (4, 4)}
 
     def relayout(self, idx=None):
         while self.grid_layout.count():
             self.grid_layout.takeAt(0)
-
-        cams = list(self.cells.values())
-        if not cams:
-            return
-
-        sel = self.cells.get(getattr(self, 'selected_cam_id', None)) or cams[0]
         mode = self.grid_combo.currentIndex()
-
-        # Determine which cells are visible in this layout, hide the rest.
-        # takeAt() only removes the layout item — the widget stays visible at its
-        # old position unless we explicitly hide it (the "ghost grid in 1×1" bug).
-        if mode == 0:
-            visible = [sel]
-        elif mode == 1:
-            visible = cams[:4]
-        elif mode == 2:
-            visible = cams[:9]
-        elif mode == 3:
-            visible = cams[:16]
-        elif mode in (4, 5):
-            # must match the layout below: big `sel` + the first 3/7 others
-            # (cams[:4] hid a selected camera that sits beyond the first few)
-            n_others = 3 if mode == 4 else 7
-            visible = [sel] + [c for c in cams if c is not sel][:n_others]
+        # Equal stretch on the used rows/cols. Without it QGridLayout gives no
+        # extra space to columns covered only by a spanning cell, so the "big"
+        # cell of 1+3 / 1+7 ended up the narrowest one.
+        rows, cols = self._GRID_DIMS.get(mode, (4, 4))
+        for i in range(6):
+            self.grid_layout.setRowStretch(i, 1 if i < rows else 0)
+            self.grid_layout.setColumnStretch(i, 1 if i < cols else 0)
+        placed = []                      # (slot | None, widget, position)
+        if mode == 0:                    # 1×1: the selected camera
+            sel = self._ensure_cell(getattr(self, 'selected_cam_id', None))
+            if sel is None:
+                sel = next((c for c in map(self._ensure_cell, self.slots) if c), None)
+            if sel is not None:
+                placed.append((None, sel, (0, 0, 1, 1)))
         else:
-            visible = cams
-        for c in self.cells.values():
-            if c in visible:
-                c.show()
-            else:
-                c.hide()
-
-        if mode == 0:    # 1×1
-            self.grid_layout.addWidget(sel, 0, 0)
-        elif mode == 1:  # 2×2
-            for i, c in enumerate(cams[:4]):
-                self.grid_layout.addWidget(c, i//2, i%2)
-        elif mode == 2:  # 3×3
-            for i, c in enumerate(cams[:9]):
-                self.grid_layout.addWidget(c, i//3, i%3)
-        elif mode == 3:  # 4×4
-            for i, c in enumerate(cams[:16]):
-                self.grid_layout.addWidget(c, i//4, i%4)
-        elif mode == 4:  # 1+3
-            self.grid_layout.addWidget(sel, 0, 0, 2, 2)
-            others = [c for c in cams if c is not sel]
-            for i, c in enumerate(others[:3]):
-                self.grid_layout.addWidget(c, i, 2)
-        elif mode == 5:  # 1+7
-            self.grid_layout.addWidget(sel, 0, 0, 2, 2)
-            others = [c for c in cams if c is not sel]
-            for i, c in enumerate(others[:7]):
-                row, col = divmod(i, 2)
-                # Right column (2 rows) + bottom row
-                if i < 2:
-                    self.grid_layout.addWidget(c, i, 2)
-                else:
-                    self.grid_layout.addWidget(c, 2, i-2)
+            for i in range(self._SLOT_COUNTS.get(mode, self._MAX_SLOTS)):
+                uid = self.slots[i]
+                w = self._ensure_cell(uid) if uid else None
+                placed.append((i, w or self._empty_slot(i), self._slot_pos(mode, i)))
+        self._slot_at = {}
+        self._placed_cells = []
+        shown = []
+        for i, w, (r, c, rs, cs) in placed:
+            self.grid_layout.addWidget(w, r, c, rs, cs)
+            w.show()
+            shown.append(w)
+            if i is not None:
+                self._slot_at[w] = i
+            if isinstance(w, VideoCell):
+                self._placed_cells.append(w)
+        # Hide everything else living in the grid: takeAt() only removes the
+        # layout item, the widget would stay painted at its old position.
+        for w in list(self.cells.values()) + self._empty_widgets:
+            if w not in shown:
+                w.hide()
 
     def _grid_drag_enter(self, e):
         if e.mimeData().hasText():
             e.acceptProposedAction()
 
+    def _slot_from_pos(self, pos):
+        w = self.grid_widget.childAt(pos)
+        while w is not None and w is not self.grid_widget:
+            if w in self._slot_at:
+                return self._slot_at[w]
+            w = w.parentWidget()
+        return None
+
     def _grid_drop(self, e):
+        """Drop a camera (from the list or from another cell) onto a cell."""
         uid = e.mimeData().text()
-        cell = self._ensure_cell(uid)
-        if cell is None:
+        if self._camera(uid) is None:
             return
+        e.acceptProposedAction()
         if self.grid_combo.currentIndex() == 0:
-            # Already in 1×1 → make this the single shown camera
-            self.select_camera(uid)
-            if not cell._streaming:
-                cell.start_stream(self._should_use_sub())
-        else:
-            # Multi-view (2×2, 3×3, …): just start this camera in its own cell;
-            # do NOT collapse to 1×1. A camera that isn't in the current grid
-            # would only stream hidden (wasted bandwidth / cloud session).
-            if not cell._streaming and cell.isVisible():
-                cell.start_stream(self._should_use_sub())
+            self.select_camera(uid)      # 1×1: show (and start) the dropped camera
+            return
+        slot = self._slot_from_pos(e.pos())
+        if slot is None:
+            return
+        self._place(slot, uid)
+        self.select_camera(uid, promote=False)
+        cell = self.cells.get(uid)
+        if cell is not None and not cell._streaming:
+            cell.start_stream(self._should_use_sub())
 
     def start_all(self):
+        """Start every camera that is on screen in the current layout."""
         sub = self._should_use_sub()
-        for cell in self.cells.values():
+        for cell in list(self._placed_cells):
             cell.start_stream(sub)
         self._apply_live_audio()
 
     def stop_all(self):
         self._audio_player.stop()
+        self._resume.clear()
         for cell in self.cells.values():
             cell.stop_stream()
 

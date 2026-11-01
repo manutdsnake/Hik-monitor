@@ -9,7 +9,7 @@ I wrote it for my own NVR because iVMS-4200 has no proper Linux build.
 
 - Live view with 1×1, 2×2, 3×3, 4×4, 1+3 and 1+7 grid layouts
 - Recording playback with timeline scrubbing and 0.25×–8× speed
-- Multiple NVRs, drag-and-drop cameras into grid cells
+- Multiple NVRs, drag any camera into any grid cell
 - Native Hikvision/Safire (HCNetSDK), generic ONVIF, and manual RTSP
 - Hik-Connect cloud: sign in with your Hik-Connect account and watch live view
   and recordings from anywhere — no port forwarding, no SDK

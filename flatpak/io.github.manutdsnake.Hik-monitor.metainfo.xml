@@ -23,7 +23,7 @@
     <ul>
       <li>Live view with 1x1, 2x2, 3x3, 4x4, 1+3 and 1+7 grid layouts</li>
       <li>Recording search and playback with timeline scrubbing and speed control</li>
-      <li>Multi-NVR support and drag-and-drop cameras into grid cells</li>
+      <li>Multi-NVR support; drag any camera into any grid cell</li>
       <li>GPU-accelerated playback via VAAPI when available</li>
       <li>ONVIF discovery and manual RTSP — work without any vendor SDK</li>
       <li>Hik-Connect cloud sign-in: live view and recording playback without port forwarding</li>
