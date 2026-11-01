@@ -50,7 +50,7 @@ ok "Virtual environment OK"
 # ── 4. Python packages venv ────────────────────────────────────
 info "Installing Python pakete to venv..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q PyQt5 requests numpy opencv-python psutil
+"$VENV_DIR/bin/pip" install -q PyQt5 requests numpy opencv-python psutil pycryptodome pyezvizapi
 ok "Python paketi OK"
 
 # ── 5. Setup SDK ─────────────────────────────────────────────

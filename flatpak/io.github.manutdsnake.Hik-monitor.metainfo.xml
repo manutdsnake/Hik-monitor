@@ -26,6 +26,7 @@
       <li>Multi-NVR support and drag-and-drop cameras into grid cells</li>
       <li>GPU-accelerated playback via VAAPI when available</li>
       <li>ONVIF discovery and manual RTSP — work without any vendor SDK</li>
+      <li>Hik-Connect cloud sign-in: live view and recording playback without port forwarding</li>
     </ul>
     <p>
       Live view and playback for native Hikvision devices use the proprietary

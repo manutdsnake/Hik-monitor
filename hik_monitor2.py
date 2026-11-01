@@ -358,20 +358,42 @@ class NVRClient:
                     elif dtype == 'rtsp':
                         c = ManualRTSPClient(d.get('id'), d.get('name', 'RTSP Camera'))
                         c.url = d.get('url', '')
+                    elif dtype == 'hikconnect':
+                        c = HikConnectClient(d.get('id'), d.get('name', 'Hik-Connect'))
+                        c.account = d.get('account', '')
+                        c.password_md5 = d.get('password_md5', '')
+                        c.api_base = d.get('api_base') or None
+                        c.client_version = d.get('client_version') or None
                     else:
                         c = cls(d.get('id'), d.get('name', 'NVR'))
                         c.username = d.get('username', 'admin')
                         c.password = d.get('password', '')
-                    c.host = d.get('host', '')
-                    c.port = d.get('port', 80)
+                    if dtype != 'hikconnect':
+                        c.host = d.get('host', '')
+                        c.port = d.get('port', 80)
                     clients.append(c)
             except: pass
         return clients
 
     @staticmethod
     def save_all(clients):
-        CONFIG_FILE.write_text(json.dumps(
-            {'devices': [c.to_dict() for c in clients]}, indent=2))
+        # Holds credentials → owner-only (0600), and atomic (temp + replace)
+        # so a crash mid-write can't leave a truncated file behind.
+        data = json.dumps({'devices': [c.to_dict() for c in clients]}, indent=2)
+        tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + '.tmp')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG_FILE)
+        except Exception:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+        try: os.chmod(CONFIG_FILE, 0o600)
+        except OSError: pass
 
     def to_dict(self):
         return {'id': self.device_id, 'name': self.name, 'host': self.host,
@@ -897,6 +919,112 @@ class ManualRTSPClient:
                 'port': self.port, 'type': 'rtsp', 'url': self.url}
 
 
+# ── Hik-Connect cloud account ────────────────────────────────────────────────────
+class HikConnectClient:
+    """All cameras of a Hik-Connect account, viewed through the Hikvision
+    cloud relay (like the mobile app) — no local IP / port forwarding needed.
+    Only the MD5 of the password is stored (that is all the API ever sees)."""
+    device_type = 'hikconnect'
+
+    def __init__(self, device_id=None, name='Hik-Connect'):
+        self.device_id = device_id or str(id(self))
+        self.name      = name
+        self.account   = ''
+        self.password_md5 = ''
+        self.api_base  = None        # regional API host, learned at login
+        self.client_version = None
+        self.host      = 'Hik-Connect cloud'   # display + "is configured" flag
+        self.port      = 443
+        self.username  = ''
+        self.password  = ''
+        self.sdk_user_id = -1
+        self.start_dchan = 1
+        self.sdk_supports_download = True
+        self._cloud    = None
+        self._cams     = {}          # 'SERIAL_CH' → hik_cloud.CloudCamera
+        self._lock     = threading.Lock()
+
+    def cloud(self):
+        import hik_cloud
+        with self._lock:
+            if self._cloud is None or self._cloud.account != self.account \
+                    or self._cloud.password_md5 != self.password_md5:
+                self._cloud = hik_cloud.HikConnectCloud(
+                    self.account, self.password_md5, api_base=self.api_base,
+                    client_version=self.client_version)
+            return self._cloud
+
+    def test(self):
+        try:
+            import hik_cloud
+        except ImportError as e:
+            return False, f'Hik-Connect support missing ({e}) — pip install pyezvizapi'
+        if not self.account or not self.password_md5:
+            return False, 'Account and password required'
+        try:
+            c = self.cloud()
+            c.login()
+            self.api_base = c.base_url
+            self._cams = {cam.key: cam for cam in c.list_cameras()}
+        except hik_cloud.HikCloudError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, f'Hik-Connect: {e}'
+        return True, f'OK — {len(self._cams)} camera(s)'
+
+    def get_cameras(self):
+        return [{'id': k, 'name': cam.name, 'ip': cam.device_name, 'status': 'online'}
+                for k, cam in self._cams.items()]
+
+    def camera(self, channel_id):
+        return self._cams.get(str(channel_id))
+
+    def live_source(self, channel_id, sub=False):
+        """VideoWorker cloud_source for one channel."""
+        return {'client': self, 'camera': self.camera(channel_id), 'sub': sub}
+
+    def snapshot(self, channel_id):
+        cam = self.camera(channel_id)
+        return self.cloud().snapshot(cam) if cam else None
+
+    def playback_source(self, channel_id, start_dt, end_dt):
+        """VideoWorker cloud_source replaying the device's own recording."""
+        return {'client': self, 'camera': self.camera(channel_id),
+                'playback': (start_dt, end_dt)}
+
+    def rtsp_live_url(self, channel_id, sub=False):
+        return None              # no RTSP — cloud streams go via live_source()
+
+    def sdk_login(self):  return False
+    def sdk_logout(self): pass
+    def sdk_channel(self, channel_num): return channel_num
+
+    def get_recordings(self, channel, date):
+        """Recordings of one day from the NVR/SD card, searched via the cloud.
+        Same shape as NVRClient (Hik 'Z' = device local time)."""
+        cam = self.camera(channel)
+        if cam is None:
+            return []
+        start = datetime(date.year, date.month, date.day)
+        try:
+            recs = self.cloud().search_records(cam, start,
+                                               start + timedelta(hours=23, minutes=59, seconds=59))
+        except Exception as e:
+            print(f'[Hik-Connect] record search failed: {e}')
+            return []
+        return [{'start': r['begin'] + 'Z', 'end': r['end'] + 'Z', 'uri': '',
+                 'type': r.get('type', '')} for r in recs]
+
+    def to_dict(self):
+        d = {'id': self.device_id, 'name': self.name, 'type': 'hikconnect',
+             'account': self.account, 'password_md5': self.password_md5}
+        if self.api_base:
+            d['api_base'] = self.api_base
+        if self.client_version:
+            d['client_version'] = self.client_version
+        return d
+
+
 # ── Video Worker Thread ────────────────────────────────────────────────────────
 def _sniff_codec(data: bytes):
     """
@@ -941,12 +1069,14 @@ class VideoWorker(QThread):
     position_ms = pyqtSignal(int)
 
     def __init__(self, channel_id, url, speed=1.0, http_auth=None, sdk_source=None,
-                 decode_w=1280, decode_h=720):
+                 decode_w=1280, decode_h=720, cloud_source=None):
         super().__init__()
         self.channel_id = channel_id
         self.rtsp_url   = url
         self.http_auth  = http_auth
         self.sdk_source = sdk_source
+        self.cloud_source = cloud_source   # Hik-Connect: {'client','camera','sub'}
+        self._cloud_stream = None
         self.speed      = speed
         self.decode_w   = decode_w
         self.decode_h   = decode_h
@@ -1065,11 +1195,17 @@ class VideoWorker(QThread):
             try: self._player.close()
             except: pass
             self._player = None
+        cs, self._cloud_stream = self._cloud_stream, None
+        if cs is not None:
+            try: cs.close()          # unblocks the feeder's socket read
+            except Exception: pass
         if self._proc:
+            # terminate BEFORE closing stdin: a feeder thread blocked writing
+            # into a full pipe holds the stdin lock, so close() would hang.
+            try: self._proc.terminate()
+            except: pass
             try:
                 if self._proc.stdin: self._proc.stdin.close()
-            except: pass
-            try: self._proc.terminate()
             except: pass
         # Delete temp download file if any
         if self._tmp_file:
@@ -1126,6 +1262,68 @@ class VideoWorker(QThread):
             finally:
                 try: proc.stdin.close()
                 except: pass
+
+        self._feed_thread = threading.Thread(target=_feed, daemon=True)
+        self._feed_thread.start()
+        return proc
+
+    def _build_proc_cloud(self, frame_bytes):
+        """Hik-Connect cloud live: VTM relay → raw H.264/H.265 → ffmpeg pipe:0."""
+        import subprocess as sp, hik_cloud
+        src = self.cloud_source
+        cam = src.get('camera')
+        if cam is None:
+            raise RuntimeError('camera not found on the Hik-Connect account')
+        playback = src.get('playback')
+        if playback:
+            stream = hik_cloud.open_playback(src['client'].cloud(), cam, *playback)
+        else:
+            stream = hik_cloud.open_live(src['client'].cloud(), cam,
+                                         sub=src.get('sub', False))
+        if self._stop.is_set():
+            stream.close()
+            raise RuntimeError('stopped')
+        self._cloud_stream = stream
+        dlog('Cloud', f'{cam.name}: stream={stream.stream_type} fmt={stream.input_format}')
+        # Raw elementary streams carry no timestamps, so analyzeduration does
+        # nothing and ffmpeg would sit on the pipe until -probesize bytes have
+        # arrived (≈100 s on a 10 KB/s sub-stream). The format is known, the
+        # first chunk already holds the parameter sets → probe tiny.
+        if playback:
+            # Recording arrives as MPEG-PS with timestamps, often faster than
+            # real time → pace it (readrate = playback speed). PS needs a real
+            # probe to find its streams; data comes fast, so this costs little.
+            extra_in = ['-readrate', f'{self.speed or 1.0:g}', '-f', stream.input_format,
+                        '-probesize', '500000', '-analyzeduration', '1000000']
+        else:
+            extra_in = ['-f', stream.input_format, '-fflags', 'nobuffer',
+                        '-probesize', '2048', '-analyzeduration', '0']
+        cmd = self._ffmpeg_base(extra_in, 'pipe:0')
+        # stderr → DEVNULL: lossy cloud links make the decoder chatty, and an
+        # unread PIPE would eventually block ffmpeg (freeze).
+        try:
+            proc = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
+                            bufsize=frame_bytes)
+        except Exception:
+            stream.close()
+            raise
+
+        def _feed():
+            try:
+                for chunk in stream.iter_chunks():
+                    if self._stop.is_set():
+                        break
+                    proc.stdin.write(chunk)
+                    # stdin is buffered with bufsize=frame_bytes (~0.7–2.7 MB);
+                    # a 10 KB/s sub-stream would never reach ffmpeg without this.
+                    proc.stdin.flush()
+            except Exception as e:
+                if not self._stop.is_set():
+                    dlog('Cloud', f'{cam.name}: feed ended: {e}')
+            finally:
+                stream.close()
+                try: proc.stdin.close()
+                except Exception: pass
 
         self._feed_thread = threading.Thread(target=_feed, daemon=True)
         self._feed_thread.start()
@@ -1686,7 +1884,9 @@ class VideoWorker(QThread):
         frame_bytes = W * H * 3
 
         try:
-            if self.sdk_source is not None:
+            if self.cloud_source is not None:
+                self._proc = self._build_proc_cloud(frame_bytes)
+            elif self.sdk_source is not None:
                 self._proc = self._build_proc_sdk(frame_bytes)
             elif self.http_auth and self.rtsp_url.startswith('http'):
                 self._proc = self._build_proc_http(frame_bytes)
@@ -1715,7 +1915,7 @@ class VideoWorker(QThread):
                 ret = self._proc.poll()
                 if ret is not None or not raw:
                     err = b''
-                    try: err = self._proc.stderr.read(2000)
+                    try: err = self._proc.stderr.read(2000) if self._proc.stderr else b''
                     except: pass
                     msg = err.decode(errors='replace').strip()
                     if msg:
@@ -1744,7 +1944,10 @@ class VideoWorker(QThread):
             self.frame_ready.emit(self.channel_id, qi)
 
             if self.channel_id == 'playback' and frame_counter % 15 == 0:
-                self.position_ms.emit(int(frame_counter / self.fps * 1000))
+                # absolute position within the recording (cloud seek starts
+                # the stream at _file_base_offset_s; 0 for other sources)
+                self.position_ms.emit(int((frame_counter / self.fps
+                                           + self._file_base_offset_s) * 1000))
 
         if self._proc:
             try: self._proc.terminate()
@@ -1986,8 +2189,12 @@ class FullscreenWindow(QWidget):
         lay.addWidget(self.label)
 
         real_ch = channel_id.split('_', 1)[-1] if '_' in channel_id else channel_id
-        self.worker = VideoWorker(f'fs_{channel_id}', nvr.rtsp_live_url(real_ch),
-                                  decode_w=1280, decode_h=720)
+        if getattr(nvr, 'device_type', '') == 'hikconnect':
+            self.worker = VideoWorker(f'fs_{channel_id}', '', decode_w=1280, decode_h=720,
+                                      cloud_source=nvr.live_source(real_ch, sub=False))
+        else:
+            self.worker = VideoWorker(f'fs_{channel_id}', nvr.rtsp_live_url(real_ch),
+                                      decode_w=1280, decode_h=720)
         self.worker.frame_ready.connect(self._on_frame, Qt.QueuedConnection)
         self.worker.error.connect(lambda _, m: self.label.setText(f'⚠ {m}'))
         self.worker.start()
@@ -2010,6 +2217,7 @@ class FullscreenWindow(QWidget):
 # ── Video Cell Widget ──────────────────────────────────────────────────────────
 class VideoCell(QFrame):
     clicked = pyqtSignal(str)
+    _preview_ready = pyqtSignal(object, bytes)   # (worker, jpeg) from bg thread
 
     def __init__(self, channel_id, name, nvr: NVRClient, parent=None, real_channel=None):
         super().__init__(parent)
@@ -2064,6 +2272,28 @@ class VideoCell(QFrame):
         bar_lay.addWidget(self.status_dot)
 
         lay.addWidget(bar)
+        self._preview_ready.connect(self._on_preview)
+
+    def _fetch_cloud_preview(self, worker):
+        """Hik-Connect: show the cloud snapshot while the live stream spins up."""
+        def _run():
+            try:
+                jpg = self.nvr.snapshot(self.real_channel)
+            except Exception as e:
+                dlog('Cloud', f'{self.name}: preview failed: {e}')
+                return
+            if jpg:
+                self._preview_ready.emit(worker, jpg)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_preview(self, worker, jpg):
+        # Only while this same stream is still connecting (no video yet).
+        if worker is not self.worker or self.video_label.isVisible():
+            return
+        pm = QPixmap()
+        if pm.loadFromData(jpg) and not pm.isNull():
+            self.placeholder.setPixmap(pm.scaled(
+                self.placeholder.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -2126,7 +2356,18 @@ class VideoCell(QFrame):
         # emit a non-standard live stream (H.264 profile 53) that PlayM4 cannot
         # decode → it would feed data but yield 0 frames ("connecting" forever).
         # Those fall through to the RTSP path instead.
-        if (_PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0
+        if getattr(self.nvr, 'device_type', '') == 'hikconnect':
+            dlog('Live', f'CLOUD {"sub" if sub else "main"} {self.name}  '
+                  f'ch={self.real_channel}  decode={dw}x{dh}')
+            self.worker = VideoWorker(
+                self.channel_id, '', decode_w=dw, decode_h=dh,
+                cloud_source=self.nvr.live_source(self.real_channel, sub))
+            # Cloud snapshot as a placeholder, but only if video is slow to
+            # arrive (sub-streams usually start in ~1 s; skip the API call).
+            QTimer.singleShot(1500, lambda w=self.worker: (
+                self._fetch_cloud_preview(w)
+                if w is self.worker and not self.video_label.isVisible() else None))
+        elif (_PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0
                 and getattr(self.nvr, 'sdk_supports_download', True)):
             dlog('Live', f'SDK {"sub" if sub else "main"} {self.name}  '
                   f'ch={self.real_channel}  decode={dw}x{dh}')
@@ -2403,12 +2644,34 @@ class LiveViewTab(QWidget):
             self.cells[uid] = cell
         self.relayout(0)
 
+    def _ensure_cell(self, uid):
+        """Cells are pre-built only for the first 16 cameras (the largest grid).
+        Any later camera — e.g. a Hik-Connect account's 2nd NVR when local
+        devices come first — gets its cell on demand when selected/dropped;
+        before, selecting it silently showed camera #1 and started nothing."""
+        cell = self.cells.get(uid)
+        if cell is not None or not uid:
+            return cell
+        cam = next((c for c in getattr(self, 'cameras', []) if c.get('id') == uid), None)
+        if cam is None:
+            return None
+        real_ch = uid.split('_', 1)[-1] if '_' in uid else uid
+        # Parent = grid widget, so it can never pop up as a top-level window;
+        # relayout() shows it and places it in the layout when needed.
+        cell = VideoCell(uid, cam['name'], cam.get('_nvr', self.nvr),
+                         parent=self.grid_widget, real_channel=real_ch)
+        cell.hide()
+        cell.clicked.connect(self.select_camera)
+        self.cells[uid] = cell
+        return cell
+
     def select_camera(self, channel_id):
         """Select camera for 1×1 view. To avoid a slow gap while the old worker
         dies, we START the new camera first, then stop the old one a moment later
         (overlap). This makes switching feel instant."""
         old_id = getattr(self, 'selected_cam_id', None)
         self.selected_cam_id = channel_id
+        self._ensure_cell(channel_id)
         self.ptz_box.setVisible(bool(getattr(self.nvr, 'has_ptz', False)))
 
         # Audio is OFF by default on EVERY camera — never carry it across a switch.
@@ -2583,7 +2846,10 @@ class LiveViewTab(QWidget):
         elif mode == 3:
             visible = cams[:16]
         elif mode in (4, 5):
-            visible = cams[:(4 if mode == 4 else 8)]
+            # must match the layout below: big `sel` + the first 3/7 others
+            # (cams[:4] hid a selected camera that sits beyond the first few)
+            n_others = 3 if mode == 4 else 7
+            visible = [sel] + [c for c in cams if c is not sel][:n_others]
         else:
             visible = cams
         for c in self.cells.values():
@@ -2625,9 +2891,9 @@ class LiveViewTab(QWidget):
 
     def _grid_drop(self, e):
         uid = e.mimeData().text()
-        if uid not in self.cells:
+        cell = self._ensure_cell(uid)
+        if cell is None:
             return
-        cell = self.cells[uid]
         if self.grid_combo.currentIndex() == 0:
             # Already in 1×1 → make this the single shown camera
             self.select_camera(uid)
@@ -2635,8 +2901,9 @@ class LiveViewTab(QWidget):
                 cell.start_stream(self._should_use_sub())
         else:
             # Multi-view (2×2, 3×3, …): just start this camera in its own cell;
-            # do NOT collapse to 1×1.
-            if not cell._streaming:
+            # do NOT collapse to 1×1. A camera that isn't in the current grid
+            # would only stream hidden (wasted bandwidth / cloud session).
+            if not cell._streaming and cell.isVisible():
                 cell.start_stream(self._should_use_sub())
 
     def start_all(self):
@@ -3300,8 +3567,16 @@ class PlaybackTab(QWidget):
         spd = speed_override if speed_override is not None else \
               self._speeds[self.speed_combo.currentIndex()]
 
+        if getattr(nvr, 'device_type', '') == 'hikconnect':
+            # Cloud replay of the NVR's own recording; seek = start later.
+            rec_end_dt = self._rec_start_dt + timedelta(seconds=self._rec_dur_s)
+            dlog('Playback', f'CLOUD ch={real_cam_id} {play_start_dt:%H:%M:%S}→{rec_end_dt:%H:%M:%S}')
+            self.worker = VideoWorker(
+                'playback', '', speed=spd, decode_w=1280, decode_h=720,
+                cloud_source=nvr.playback_source(real_cam_id, play_start_dt, rec_end_dt))
+            self.worker._file_base_offset_s = self._seek_offset_s
         # SDK is preferred for playback — avoids RTSP bandwidth (453) errors entirely
-        if _SDK and nvr.sdk_user_id >= 0:
+        elif _SDK and nvr.sdk_user_id >= 0:
             rec_end_dt = self._rec_start_dt + timedelta(seconds=self._rec_dur_s)
             # iVMS-style seek: when seeking, START the SDK download AT the seek
             # point (not the recording's beginning). The file then begins at the
@@ -3863,6 +4138,94 @@ class ManualRTSPDialog(QWidget):
         self.close()
 
 
+class HikConnectDialog(QWidget):
+    """Add / edit a Hik-Connect cloud account."""
+    saved   = pyqtSignal(object)        # emits HikConnectClient
+    _result = pyqtSignal(bool, str)     # worker thread → UI thread
+
+    def __init__(self, client=None, parent=None):
+        super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setWindowTitle('Hik-Connect account' if client is None
+                            else 'Edit Hik-Connect account')
+        self.setFixedWidth(380)
+        self._client = client
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(8)
+        lay.addWidget(QLabel('Name:'))
+        self.f_name = QLineEdit(client.name if client else 'Hik-Connect')
+        lay.addWidget(self.f_name)
+        lay.addWidget(QLabel('Account (email or phone):'))
+        self.f_account = QLineEdit(client.account if client else '')
+        lay.addWidget(self.f_account)
+        lay.addWidget(QLabel('Password:'))
+        self.f_pass = QLineEdit()
+        self.f_pass.setEchoMode(QLineEdit.Password)
+        if client and client.password_md5:
+            self.f_pass.setPlaceholderText('(unchanged)')
+        lay.addWidget(self.f_pass)
+        hint = QLabel('Cameras are streamed through the Hikvision cloud, like the '
+                      'mobile app — no IP or port forwarding needed. Only a hash '
+                      'of the password is stored. If login asks for a CAPTCHA, '
+                      'sign in once in the official app first.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f'color:{DARK["dim"]};font-size:11px;')
+        lay.addWidget(hint)
+        self.btn = QPushButton('Sign in')
+        self.btn.setStyleSheet(f'background:{DARK["accent"]};color:white;'
+                               f'font-weight:600;padding:8px;')
+        self.btn.clicked.connect(self._sign_in)
+        lay.addWidget(self.btn)
+        self.lbl = QLabel('')
+        self.lbl.setWordWrap(True)
+        self.lbl.setStyleSheet('font-size:12px;')
+        lay.addWidget(self.lbl)
+        self._result.connect(self._on_result)
+        self._pending = None
+
+    def _sign_in(self):
+        import uuid
+        account = self.f_account.text().strip()
+        password = self.f_pass.text()
+        if not account or not (password or (self._client and self._client.password_md5)):
+            self.lbl.setText('Enter account and password')
+            return
+        c = HikConnectClient(self._client.device_id if self._client else str(uuid.uuid4()))
+        c.name = self.f_name.text().strip() or 'Hik-Connect'
+        c.account = account
+        if password:
+            import hik_cloud
+            c.password_md5 = hik_cloud.md5_password(password)
+        else:
+            c.password_md5 = self._client.password_md5
+        if self._client and self._client.account == account:
+            c.api_base = self._client.api_base
+            c.client_version = self._client.client_version
+        self._pending = c
+        self.btn.setText('Signing in…')
+        self.btn.setEnabled(False)
+        threading.Thread(target=lambda: self._result.emit(*c.test()),
+                         daemon=True).start()
+
+    def _on_result(self, ok, msg):
+        self.btn.setText('Sign in')
+        self.btn.setEnabled(True)
+        if not ok:
+            self.lbl.setText(f'✗ {msg}')
+            self.lbl.setStyleSheet(f'font-size:12px;color:{DARK["red"]};')
+            return
+        c = self._pending
+        if self._client is not None:      # edit in place: keep the same object
+            o = self._client
+            o.name, o.account, o.password_md5 = c.name, c.account, c.password_md5
+            o.api_base, o._cloud, o._cams = c.api_base, c._cloud, c._cams
+            c = o
+        self.lbl.setText(f'✓ {msg}')
+        self.lbl.setStyleSheet(f'font-size:12px;color:{DARK["green"]};')
+        self.saved.emit(c)
+        self.close()
+
+
 class DeviceDialog(QWidget):
     """Floating panel to add or edit an NVR device"""
     saved = pyqtSignal(object)   # emits NVRClient
@@ -4290,6 +4653,7 @@ class MainWindow(QMainWindow):
         a_nvr   = m.addAction('NVR  (Hikvision / Safire)…')
         a_onvif = m.addAction('Scan ONVIF network…')
         a_rtsp  = m.addAction('Manual RTSP URL…')
+        a_cloud = m.addAction('Hik-Connect account (cloud)…')
         btn = self.sender()
         pos = btn.mapToGlobal(btn.rect().bottomLeft()) if btn else self.cursor().pos()
         act = m.exec_(pos)
@@ -4303,6 +4667,8 @@ class MainWindow(QMainWindow):
             self._scan_onvif()
         elif act == a_rtsp:
             self._add_manual_rtsp()
+        elif act == a_cloud:
+            self._add_hikconnect()
 
     def _maybe_offer_sdk(self):
         """If the native Hikvision SDK isn't loaded, offer to download+install
@@ -4332,6 +4698,11 @@ class MainWindow(QMainWindow):
 
     def _add_manual_rtsp(self):
         dlg = ManualRTSPDialog(self)
+        dlg.saved.connect(self._on_device_saved)
+        dlg.show()
+
+    def _add_hikconnect(self):
+        dlg = HikConnectDialog(None, self)
         dlg.saved.connect(self._on_device_saved)
         dlg.show()
 
@@ -4404,8 +4775,14 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f'[{nvr.name}] connecting...')
                 threading.Thread(target=self._connect_device, args=(nvr,), daemon=True).start()
         elif action == edit_action:
-            dlg = DeviceDialog(nvr, self)
-            dlg.saved.connect(lambda n: (NVRClient.save_all(self.devices), self._refresh_device_list()))
+            if getattr(nvr, 'device_type', '') == 'hikconnect':
+                dlg = HikConnectDialog(nvr, self)
+            else:
+                dlg = DeviceDialog(nvr, self)
+            if getattr(nvr, 'device_type', '') == 'hikconnect':
+                dlg.saved.connect(self._on_device_saved)   # re-list cameras
+            else:
+                dlg.saved.connect(lambda n: (NVRClient.save_all(self.devices), self._refresh_device_list()))
             dlg.show()
         elif action == remove_action:
             self._disconnect_device(nvr)
