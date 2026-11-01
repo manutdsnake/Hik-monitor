@@ -3,4 +3,4 @@ requests
 opencv-python
 numpy
 pycryptodome
-pyezvizapi
+pyezvizapi; python_version >= "3.12"   # Hik-Connect cloud streaming

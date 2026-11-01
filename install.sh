@@ -50,7 +50,11 @@ ok "Virtual environment OK"
 # ── 4. Python packages venv ────────────────────────────────────
 info "Installing Python pakete to venv..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q PyQt5 requests numpy opencv-python psutil pycryptodome pyezvizapi
+"$VENV_DIR/bin/pip" install -q PyQt5 requests numpy opencv-python psutil pycryptodome
+# Hik-Connect cloud streaming needs pyezvizapi, which requires Python 3.12+.
+# Optional, so older distros (Debian 12, Ubuntu 22.04) still get the app.
+"$VENV_DIR/bin/pip" install -q pyezvizapi \
+    || info "Skipping Hik-Connect cloud streaming (needs Python 3.12+)"
 ok "Python paketi OK"
 
 # ── 5. Setup SDK ─────────────────────────────────────────────
