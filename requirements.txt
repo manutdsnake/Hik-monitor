@@ -2,3 +2,5 @@ PyQt5
 requests
 opencv-python
 numpy
+pycryptodome
+pyezvizapi

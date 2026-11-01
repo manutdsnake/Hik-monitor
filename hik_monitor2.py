@@ -5,7 +5,7 @@ DS-7604NI-K1/4P kompatibilan
 ISAPI za upravljanje + OpenCV za RTSP video
 """
 
-import sys, os, json, threading, time, queue
+import sys, os, json, threading, time, queue, webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,6 +27,10 @@ def _bootstrap_sdk_path():
             sdk_path = alt
         else:
             return   # no SDK installed — app will run ONVIF/RTSP-only
+    # hik_sdk / hik_play load the libraries from HIKVISION_SDK_PATH (else
+    # ~/Desktop/sdk/lib). Without this the auto-installed SDK (Flatpak) was
+    # found here but not loaded after the first restart.
+    os.environ.setdefault('HIKVISION_SDK_PATH', sdk_path)
     com_path = os.path.join(sdk_path, 'HCNetSDKCom')
     parts = (os.environ.get('LD_LIBRARY_PATH', '') or '').split(':')
     if sdk_path in parts:
@@ -223,6 +227,12 @@ from PyQt5.QtGui import (
 
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / '.hikvision_monitor.json'
+if os.environ.get('FLATPAK_ID') or os.path.exists('/.flatpak-info'):
+    # In the Flatpak sandbox $HOME is a throwaway tmpfs, so the device list was
+    # lost on every restart. Use the app's persistent config dir instead
+    # (~/.var/app/<id>/config). Native installs keep the file above.
+    CONFIG_FILE = Path(os.environ.get('XDG_CONFIG_HOME')
+                       or Path.home() / '.config') / 'hik-monitor' / 'devices.json'
 
 DARK = {
     'bg':       '#0d1117',
@@ -358,20 +368,43 @@ class NVRClient:
                     elif dtype == 'rtsp':
                         c = ManualRTSPClient(d.get('id'), d.get('name', 'RTSP Camera'))
                         c.url = d.get('url', '')
+                    elif dtype == 'hikconnect':
+                        c = HikConnectClient(d.get('id'), d.get('name', 'Hik-Connect'))
+                        c.account = d.get('account', '')
+                        c.password_md5 = d.get('password_md5', '')
+                        c.api_base = d.get('api_base') or None
+                        c.client_version = d.get('client_version') or None
                     else:
                         c = cls(d.get('id'), d.get('name', 'NVR'))
                         c.username = d.get('username', 'admin')
                         c.password = d.get('password', '')
-                    c.host = d.get('host', '')
-                    c.port = d.get('port', 80)
+                    if dtype != 'hikconnect':
+                        c.host = d.get('host', '')
+                        c.port = d.get('port', 80)
                     clients.append(c)
             except: pass
         return clients
 
     @staticmethod
     def save_all(clients):
-        CONFIG_FILE.write_text(json.dumps(
-            {'devices': [c.to_dict() for c in clients]}, indent=2))
+        # Holds credentials → owner-only (0600), and atomic (temp + replace)
+        # so a crash mid-write can't leave a truncated file behind.
+        data = json.dumps({'devices': [c.to_dict() for c in clients]}, indent=2)
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + '.tmp')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG_FILE)
+        except Exception:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise
+        try: os.chmod(CONFIG_FILE, 0o600)
+        except OSError: pass
 
     def to_dict(self):
         return {'id': self.device_id, 'name': self.name, 'host': self.host,
@@ -897,6 +930,112 @@ class ManualRTSPClient:
                 'port': self.port, 'type': 'rtsp', 'url': self.url}
 
 
+# ── Hik-Connect cloud account ────────────────────────────────────────────────────
+class HikConnectClient:
+    """All cameras of a Hik-Connect account, viewed through the Hikvision
+    cloud relay (like the mobile app) — no local IP / port forwarding needed.
+    Only the MD5 of the password is stored (that is all the API ever sees)."""
+    device_type = 'hikconnect'
+
+    def __init__(self, device_id=None, name='Hik-Connect'):
+        self.device_id = device_id or str(id(self))
+        self.name      = name
+        self.account   = ''
+        self.password_md5 = ''
+        self.api_base  = None        # regional API host, learned at login
+        self.client_version = None
+        self.host      = 'Hik-Connect cloud'   # display + "is configured" flag
+        self.port      = 443
+        self.username  = ''
+        self.password  = ''
+        self.sdk_user_id = -1
+        self.start_dchan = 1
+        self.sdk_supports_download = True
+        self._cloud    = None
+        self._cams     = {}          # 'SERIAL_CH' → hik_cloud.CloudCamera
+        self._lock     = threading.Lock()
+
+    def cloud(self):
+        import hik_cloud
+        with self._lock:
+            if self._cloud is None or self._cloud.account != self.account \
+                    or self._cloud.password_md5 != self.password_md5:
+                self._cloud = hik_cloud.HikConnectCloud(
+                    self.account, self.password_md5, api_base=self.api_base,
+                    client_version=self.client_version)
+            return self._cloud
+
+    def test(self):
+        try:
+            import hik_cloud
+        except ImportError as e:
+            return False, f'Hik-Connect support missing ({e}) — pip install pyezvizapi'
+        if not self.account or not self.password_md5:
+            return False, 'Account and password required'
+        try:
+            c = self.cloud()
+            c.login()
+            self.api_base = c.base_url
+            self._cams = {cam.key: cam for cam in c.list_cameras()}
+        except hik_cloud.HikCloudError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, f'Hik-Connect: {e}'
+        return True, f'OK — {len(self._cams)} camera(s)'
+
+    def get_cameras(self):
+        return [{'id': k, 'name': cam.name, 'ip': cam.device_name, 'status': 'online'}
+                for k, cam in self._cams.items()]
+
+    def camera(self, channel_id):
+        return self._cams.get(str(channel_id))
+
+    def live_source(self, channel_id, sub=False):
+        """VideoWorker cloud_source for one channel."""
+        return {'client': self, 'camera': self.camera(channel_id), 'sub': sub}
+
+    def snapshot(self, channel_id):
+        cam = self.camera(channel_id)
+        return self.cloud().snapshot(cam) if cam else None
+
+    def playback_source(self, channel_id, start_dt, end_dt):
+        """VideoWorker cloud_source replaying the device's own recording."""
+        return {'client': self, 'camera': self.camera(channel_id),
+                'playback': (start_dt, end_dt)}
+
+    def rtsp_live_url(self, channel_id, sub=False):
+        return None              # no RTSP — cloud streams go via live_source()
+
+    def sdk_login(self):  return False
+    def sdk_logout(self): pass
+    def sdk_channel(self, channel_num): return channel_num
+
+    def get_recordings(self, channel, date):
+        """Recordings of one day from the NVR/SD card, searched via the cloud.
+        Same shape as NVRClient (Hik 'Z' = device local time)."""
+        cam = self.camera(channel)
+        if cam is None:
+            return []
+        start = datetime(date.year, date.month, date.day)
+        try:
+            recs = self.cloud().search_records(cam, start,
+                                               start + timedelta(hours=23, minutes=59, seconds=59))
+        except Exception as e:
+            print(f'[Hik-Connect] record search failed: {e}')
+            return []
+        return [{'start': r['begin'] + 'Z', 'end': r['end'] + 'Z', 'uri': '',
+                 'type': r.get('type', '')} for r in recs]
+
+    def to_dict(self):
+        d = {'id': self.device_id, 'name': self.name, 'type': 'hikconnect',
+             'account': self.account, 'password_md5': self.password_md5}
+        if self.api_base:
+            d['api_base'] = self.api_base
+        if self.client_version:
+            d['client_version'] = self.client_version
+        return d
+
+
 # ── Video Worker Thread ────────────────────────────────────────────────────────
 def _sniff_codec(data: bytes):
     """
@@ -941,12 +1080,14 @@ class VideoWorker(QThread):
     position_ms = pyqtSignal(int)
 
     def __init__(self, channel_id, url, speed=1.0, http_auth=None, sdk_source=None,
-                 decode_w=1280, decode_h=720):
+                 decode_w=1280, decode_h=720, cloud_source=None):
         super().__init__()
         self.channel_id = channel_id
         self.rtsp_url   = url
         self.http_auth  = http_auth
         self.sdk_source = sdk_source
+        self.cloud_source = cloud_source   # Hik-Connect: {'client','camera','sub'}
+        self._cloud_stream = None
         self.speed      = speed
         self.decode_w   = decode_w
         self.decode_h   = decode_h
@@ -1065,11 +1206,17 @@ class VideoWorker(QThread):
             try: self._player.close()
             except: pass
             self._player = None
+        cs, self._cloud_stream = self._cloud_stream, None
+        if cs is not None:
+            try: cs.close()          # unblocks the feeder's socket read
+            except Exception: pass
         if self._proc:
+            # terminate BEFORE closing stdin: a feeder thread blocked writing
+            # into a full pipe holds the stdin lock, so close() would hang.
+            try: self._proc.terminate()
+            except: pass
             try:
                 if self._proc.stdin: self._proc.stdin.close()
-            except: pass
-            try: self._proc.terminate()
             except: pass
         # Delete temp download file if any
         if self._tmp_file:
@@ -1126,6 +1273,68 @@ class VideoWorker(QThread):
             finally:
                 try: proc.stdin.close()
                 except: pass
+
+        self._feed_thread = threading.Thread(target=_feed, daemon=True)
+        self._feed_thread.start()
+        return proc
+
+    def _build_proc_cloud(self, frame_bytes):
+        """Hik-Connect cloud live: VTM relay → raw H.264/H.265 → ffmpeg pipe:0."""
+        import subprocess as sp, hik_cloud
+        src = self.cloud_source
+        cam = src.get('camera')
+        if cam is None:
+            raise RuntimeError('camera not found on the Hik-Connect account')
+        playback = src.get('playback')
+        if playback:
+            stream = hik_cloud.open_playback(src['client'].cloud(), cam, *playback)
+        else:
+            stream = hik_cloud.open_live(src['client'].cloud(), cam,
+                                         sub=src.get('sub', False))
+        if self._stop.is_set():
+            stream.close()
+            raise RuntimeError('stopped')
+        self._cloud_stream = stream
+        dlog('Cloud', f'{cam.name}: stream={stream.stream_type} fmt={stream.input_format}')
+        # Raw elementary streams carry no timestamps, so analyzeduration does
+        # nothing and ffmpeg would sit on the pipe until -probesize bytes have
+        # arrived (≈100 s on a 10 KB/s sub-stream). The format is known, the
+        # first chunk already holds the parameter sets → probe tiny.
+        if playback:
+            # Recording arrives as MPEG-PS with timestamps, often faster than
+            # real time → pace it (readrate = playback speed). PS needs a real
+            # probe to find its streams; data comes fast, so this costs little.
+            extra_in = ['-readrate', f'{self.speed or 1.0:g}', '-f', stream.input_format,
+                        '-probesize', '500000', '-analyzeduration', '1000000']
+        else:
+            extra_in = ['-f', stream.input_format, '-fflags', 'nobuffer',
+                        '-probesize', '2048', '-analyzeduration', '0']
+        cmd = self._ffmpeg_base(extra_in, 'pipe:0')
+        # stderr → DEVNULL: lossy cloud links make the decoder chatty, and an
+        # unread PIPE would eventually block ffmpeg (freeze).
+        try:
+            proc = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.DEVNULL,
+                            bufsize=frame_bytes)
+        except Exception:
+            stream.close()
+            raise
+
+        def _feed():
+            try:
+                for chunk in stream.iter_chunks():
+                    if self._stop.is_set():
+                        break
+                    proc.stdin.write(chunk)
+                    # stdin is buffered with bufsize=frame_bytes (~0.7–2.7 MB);
+                    # a 10 KB/s sub-stream would never reach ffmpeg without this.
+                    proc.stdin.flush()
+            except Exception as e:
+                if not self._stop.is_set():
+                    dlog('Cloud', f'{cam.name}: feed ended: {e}')
+            finally:
+                stream.close()
+                try: proc.stdin.close()
+                except Exception: pass
 
         self._feed_thread = threading.Thread(target=_feed, daemon=True)
         self._feed_thread.start()
@@ -1686,7 +1895,9 @@ class VideoWorker(QThread):
         frame_bytes = W * H * 3
 
         try:
-            if self.sdk_source is not None:
+            if self.cloud_source is not None:
+                self._proc = self._build_proc_cloud(frame_bytes)
+            elif self.sdk_source is not None:
                 self._proc = self._build_proc_sdk(frame_bytes)
             elif self.http_auth and self.rtsp_url.startswith('http'):
                 self._proc = self._build_proc_http(frame_bytes)
@@ -1715,7 +1926,7 @@ class VideoWorker(QThread):
                 ret = self._proc.poll()
                 if ret is not None or not raw:
                     err = b''
-                    try: err = self._proc.stderr.read(2000)
+                    try: err = self._proc.stderr.read(2000) if self._proc.stderr else b''
                     except: pass
                     msg = err.decode(errors='replace').strip()
                     if msg:
@@ -1744,7 +1955,10 @@ class VideoWorker(QThread):
             self.frame_ready.emit(self.channel_id, qi)
 
             if self.channel_id == 'playback' and frame_counter % 15 == 0:
-                self.position_ms.emit(int(frame_counter / self.fps * 1000))
+                # absolute position within the recording (cloud seek starts
+                # the stream at _file_base_offset_s; 0 for other sources)
+                self.position_ms.emit(int((frame_counter / self.fps
+                                           + self._file_base_offset_s) * 1000))
 
         if self._proc:
             try: self._proc.terminate()
@@ -1986,8 +2200,12 @@ class FullscreenWindow(QWidget):
         lay.addWidget(self.label)
 
         real_ch = channel_id.split('_', 1)[-1] if '_' in channel_id else channel_id
-        self.worker = VideoWorker(f'fs_{channel_id}', nvr.rtsp_live_url(real_ch),
-                                  decode_w=1280, decode_h=720)
+        if getattr(nvr, 'device_type', '') == 'hikconnect':
+            self.worker = VideoWorker(f'fs_{channel_id}', '', decode_w=1280, decode_h=720,
+                                      cloud_source=nvr.live_source(real_ch, sub=False))
+        else:
+            self.worker = VideoWorker(f'fs_{channel_id}', nvr.rtsp_live_url(real_ch),
+                                      decode_w=1280, decode_h=720)
         self.worker.frame_ready.connect(self._on_frame, Qt.QueuedConnection)
         self.worker.error.connect(lambda _, m: self.label.setText(f'⚠ {m}'))
         self.worker.start()
@@ -2010,6 +2228,7 @@ class FullscreenWindow(QWidget):
 # ── Video Cell Widget ──────────────────────────────────────────────────────────
 class VideoCell(QFrame):
     clicked = pyqtSignal(str)
+    _preview_ready = pyqtSignal(object, bytes)   # (worker, jpeg) from bg thread
 
     def __init__(self, channel_id, name, nvr: NVRClient, parent=None, real_channel=None):
         super().__init__(parent)
@@ -2064,10 +2283,61 @@ class VideoCell(QFrame):
         bar_lay.addWidget(self.status_dot)
 
         lay.addWidget(bar)
+        self._preview_ready.connect(self._on_preview)
+
+    def _fetch_cloud_preview(self, worker):
+        """Hik-Connect: show the cloud snapshot while the live stream spins up."""
+        def _run():
+            try:
+                jpg = self.nvr.snapshot(self.real_channel)
+            except Exception as e:
+                dlog('Cloud', f'{self.name}: preview failed: {e}')
+                return
+            if jpg:
+                try:
+                    self._preview_ready.emit(worker, jpg)
+                except RuntimeError:     # cell deleted meanwhile
+                    pass
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_preview(self, worker, jpg):
+        # Only while this same stream is still connecting (no video yet).
+        if worker is not self.worker or self.video_label.isVisible():
+            return
+        pm = QPixmap()
+        if pm.loadFromData(jpg) and not pm.isNull():
+            self.placeholder.setPixmap(pm.scaled(
+                self.placeholder.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            self._press_pos = e.pos()
             self.clicked.emit(self.channel_id)
+
+    def mouseMoveEvent(self, e):
+        # Drag this cell's camera onto another grid cell (swap / move there).
+        # Zoomed video keeps the drag for panning (the label accepts it).
+        pp = getattr(self, '_press_pos', None)
+        if (pp is not None and e.buttons() & Qt.LeftButton
+                and (e.pos() - pp).manhattanLength() >= QApplication.startDragDistance()):
+            self._press_pos = None
+            from PyQt5.QtCore import QMimeData
+            from PyQt5.QtGui import QDrag
+            mime = QMimeData()
+            mime.setText(self.channel_id)
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            pm = self.grab()
+            if not pm.isNull():
+                drag.setPixmap(pm.scaled(200, 112, Qt.KeepAspectRatio,
+                                         Qt.SmoothTransformation))
+            drag.exec_(Qt.CopyAction | Qt.MoveAction)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._press_pos = None
+        super().mouseReleaseEvent(e)
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -2112,6 +2382,7 @@ class VideoCell(QFrame):
         self.placeholder.show()
 
         self._streaming = True
+        self._sub = sub              # current quality (layout switch skips no-op restarts)
         self.status_dot.setStyleSheet(f'color: {DARK["amber"]}; font-size: 10px; border: none;')
         self.placeholder.setText(f'⏳\nConnecting...')
 
@@ -2126,7 +2397,18 @@ class VideoCell(QFrame):
         # emit a non-standard live stream (H.264 profile 53) that PlayM4 cannot
         # decode → it would feed data but yield 0 frames ("connecting" forever).
         # Those fall through to the RTSP path instead.
-        if (_PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0
+        if getattr(self.nvr, 'device_type', '') == 'hikconnect':
+            dlog('Live', f'CLOUD {"sub" if sub else "main"} {self.name}  '
+                  f'ch={self.real_channel}  decode={dw}x{dh}')
+            self.worker = VideoWorker(
+                self.channel_id, '', decode_w=dw, decode_h=dh,
+                cloud_source=self.nvr.live_source(self.real_channel, sub))
+            # Cloud snapshot as a placeholder, but only if video is slow to
+            # arrive (sub-streams usually start in ~1 s; skip the API call).
+            QTimer.singleShot(1500, lambda w=self.worker: (
+                self._fetch_cloud_preview(w)
+                if w is self.worker and not self.video_label.isVisible() else None))
+        elif (_PLAYM4_OK and _SDK and self.nvr.sdk_user_id >= 0
                 and getattr(self.nvr, 'sdk_supports_download', True)):
             dlog('Live', f'SDK {"sub" if sub else "main"} {self.name}  '
                   f'ch={self.real_channel}  decode={dw}x{dh}')
@@ -2268,15 +2550,41 @@ class LiveAudioPlayer:
 
 
 # ── Live View Tab ──────────────────────────────────────────────────────────────
+class EmptyGridSlot(QFrame):
+    """A free grid cell — drop a camera from the list (or another cell) here."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f'QFrame {{ background: #0d1117; border: 1px dashed '
+                           f'{DARK["border"]}; border-radius: 4px; }}')
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(320, 180)
+        lay = QVBoxLayout(self)
+        lbl = QLabel('＋\nDrag a camera here')
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet(f'color: {DARK["dim"]}; font-size: 12px; border: none;')
+        lay.addWidget(lbl)
+
+
 class LiveViewTab(QWidget):
     # Emitted from a background ffprobe thread → UI: (camera uid, has_audio)
     _audio_probed = pyqtSignal(str, bool)
+
+    _MAX_SLOTS = 16
+    # grid_combo index → number of slots shown ('1×1' shows the selection)
+    _SLOT_COUNTS = {1: 4, 2: 9, 3: 16, 4: 4, 5: 8}
 
     def __init__(self, nvr: NVRClient, parent=None):
         super().__init__(parent)
         self.nvr = nvr
         self.cameras = []
-        self.cells = {}
+        self.cells = {}           # uid → VideoCell, created on demand
+        # Grid slots: which camera sits in which cell of the grid. Cells are
+        # NOT reserved per camera — any camera can be dragged into any slot.
+        self.slots = [None] * self._MAX_SLOTS
+        self._empty_widgets = []  # placeholder per free slot ("drag here")
+        self._slot_at = {}        # placed widget → slot index (for drops)
+        self._placed_cells = []   # VideoCells on screen in the current layout
+        self._resume = set()      # uids playing before a layout switch
         self._cam_audio = {}      # uid -> True/False (has audio); missing = unprobed
         self._audio_probing = set()   # uids with an in-flight probe
         self._audio_probed.connect(self._on_audio_probed)
@@ -2388,27 +2696,98 @@ class LiveViewTab(QWidget):
             nvr.ptz_stop()
 
     def set_cameras(self, cameras):
+        """New camera list (called whenever any device connects/disconnects).
+        Keeps the grid arrangement and the running streams of cameras that are
+        still there; free slots get not-yet-placed cameras in list order (so a
+        fresh start still shows the first cameras, as before)."""
         self.cameras = cameras
-        self.stop_all()
-        self.cells.clear()
+        uids = [c['id'] for c in cameras]
+        known = set(uids)
+        gone = [self.cells.pop(u) for u in list(self.cells) if u not in known]
+        for cam in cameras:                       # camera dicts are rebuilt
+            cell = self.cells.get(cam['id'])
+            if cell is not None:
+                cell.nvr = cam.get('_nvr', cell.nvr)
+                if cam.get('name') and cam['name'] != cell.name:
+                    cell.name = cam['name']
+                    cell.name_label.setText(cell.name)
+        self.slots = [u if u in known else None for u in self.slots]
+        placed = {u for u in self.slots if u}
+        fresh = iter([u for u in uids if u not in placed])
+        self.slots = [u if u else next(fresh, None) for u in self.slots]
+        self._resume &= known
+        if getattr(self, 'selected_cam_id', None) not in known:
+            self.selected_cam_id = uids[0] if uids else None
+            if self._live_audio_on:
+                self._live_audio_on = False
+                self.btn_live_mute.setText('🔇')
+            self._audio_player.stop()
         self._update_quality_label()
-        self.selected_cam_id = cameras[0]['id'] if cameras else None
-        for cam in cameras[:16]:
-            nvr = cam.get('_nvr', self.nvr)
-            uid = cam['id']  # already uid after _refresh_camera_list transform
-            # Extract real channel id for RTSP (strip deviceid_ prefix)
-            real_ch = uid.split('_', 1)[-1] if '_' in uid else uid
-            cell = VideoCell(uid, cam['name'], nvr, real_channel=real_ch)
-            cell.clicked.connect(self.select_camera)
-            self.cells[uid] = cell
-        self.relayout(0)
+        self.relayout()
+        # Dispose cells of vanished cameras (the old code just cleared the dict
+        # and leaked the widgets, which stayed painted as "ghost" cells).
+        for cell in gone:
+            cell.stop_stream()
+            cell.hide()
+            cell.deleteLater()
 
-    def select_camera(self, channel_id):
+    def _camera(self, uid):
+        return next((c for c in self.cameras if c.get('id') == uid), None)
+
+    def _ensure_cell(self, uid):
+        """VideoCell for a camera, created the first time it is shown."""
+        cell = self.cells.get(uid)
+        if cell is not None or not uid:
+            return cell
+        cam = self._camera(uid)
+        if cam is None:
+            return None
+        real_ch = uid.split('_', 1)[-1] if '_' in uid else uid
+        # Parent = grid widget, so it can never pop up as a top-level window;
+        # relayout() shows it and places it in the layout when needed.
+        cell = VideoCell(uid, cam['name'], cam.get('_nvr', self.nvr),
+                         parent=self.grid_widget, real_channel=real_ch)
+        cell.hide()
+        cell.clicked.connect(self.select_camera)
+        self.cells[uid] = cell
+        return cell
+
+    def _empty_slot(self, i):
+        while len(self._empty_widgets) <= i:
+            w = EmptyGridSlot(self.grid_widget)
+            w.hide()
+            self._empty_widgets.append(w)
+        return self._empty_widgets[i]
+
+    def _visible_slots(self):
+        return self._SLOT_COUNTS.get(self.grid_combo.currentIndex(), 0)
+
+    def _place(self, slot, uid):
+        """Put camera `uid` into grid slot `slot`. If it already sits in another
+        slot the two swap; a camera pushed off screen is stopped (no hidden
+        streams eating bandwidth / cloud sessions)."""
+        old = self.slots[slot]
+        if old == uid:
+            return
+        if uid in self.slots:
+            self.slots[self.slots.index(uid)] = old
+        self.slots[slot] = uid
+        if old and old not in self.slots[:self._visible_slots()]:
+            cell = self.cells.get(old)
+            if cell is not None and cell._streaming:
+                cell.stop_stream()
+
+    def select_camera(self, channel_id, promote=True):
         """Select camera for 1×1 view. To avoid a slow gap while the old worker
         dies, we START the new camera first, then stop the old one a moment later
-        (overlap). This makes switching feel instant."""
+        (overlap). This makes switching feel instant.
+        In 1+3 / 1+7 the selected camera goes to the big cell (promote)."""
         old_id = getattr(self, 'selected_cam_id', None)
         self.selected_cam_id = channel_id
+        cam = self._camera(channel_id)
+        if cam is not None and cam.get('_nvr') is not None:
+            self.nvr = cam['_nvr']            # PTZ etc. follow the selection
+        self._ensure_cell(channel_id)
         self.ptz_box.setVisible(bool(getattr(self.nvr, 'has_ptz', False)))
 
         # Audio is OFF by default on EVERY camera — never carry it across a switch.
@@ -2436,6 +2815,8 @@ class LiveViewTab(QWidget):
                         c.stop_stream() if c is not self.cells.get(self.selected_cam_id)
                         else None))
         else:
+            if promote and cam is not None and self.grid_combo.currentIndex() in (4, 5):
+                self._place(0, channel_id)
             self.relayout(self.grid_combo.currentIndex())
         # Move live audio to the newly selected camera (silence the others).
         self._probe_selected_audio()   # detect audio capability (async, cached)
@@ -2549,104 +2930,126 @@ class LiveViewTab(QWidget):
         self.lbl_quality.setText(f'Quality: {"sub (low)" if sub else "main (HD)"}')
 
     def _on_grid_changed(self, idx):
-        """Restart active streams when grid changes to apply new quality."""
+        """Apply the new layout with the right quality: on-screen streams are
+        (re)started, streams that left the screen are stopped, and cameras that
+        were playing before come back (grid → 1×1 → grid restarts the grid)."""
         self._update_quality_label()
+        self._resume |= {u for u, c in self.cells.items() if c._streaming}
         self.relayout(idx)
-        # Restart any active streams with appropriate quality
         sub = self._should_use_sub()
-        for cell in self.cells.values():
-            if cell._streaming:
+        on_screen = self._placed_cells
+        for uid, cell in list(self.cells.items()):
+            if cell in on_screen:
+                if cell._streaming and getattr(cell, '_sub', None) == sub:
+                    continue                 # already the right quality
+                if cell._streaming or uid in self._resume:
+                    if cell._streaming:
+                        cell.stop_stream()
+                    # Tiny delay between stop/start to let NVR release the session
+                    QTimer.singleShot(300, lambda c=cell, s=sub: c.start_stream(s))
+            elif cell._streaming:
                 cell.stop_stream()
-                # Tiny delay between stop/start to let NVR release the session
-                QTimer.singleShot(300, lambda c=cell, s=sub: c.start_stream(s))
+
+    @staticmethod
+    def _slot_pos(mode, i):
+        """Grid position (row, col, rowspan, colspan) of slot i in a layout."""
+        if mode == 1:
+            return (i // 2, i % 2, 1, 1)
+        if mode == 2:
+            return (i // 3, i % 3, 1, 1)
+        if mode == 3:
+            return (i // 4, i % 4, 1, 1)
+        if mode == 4:                    # 1+3: big left (2/3), 3 stacked right
+            return (0, 0, 3, 2) if i == 0 else (i - 1, 2, 1, 1)
+        # 1+7 (as in iVMS): big 3×3 of a 4×4 grid, 3 down the right, 4 along
+        # the bottom. (The old 1+7 put 5 cells in the bottom row of a 3-wide grid.)
+        if i == 0:
+            return (0, 0, 3, 3)
+        return (i - 1, 3, 1, 1) if i <= 3 else (3, i - 4, 1, 1)
+
+    # grid_combo index → (rows, cols) of the underlying grid
+    _GRID_DIMS = {0: (1, 1), 1: (2, 2), 2: (3, 3), 3: (4, 4), 4: (3, 3), 5: (4, 4)}
 
     def relayout(self, idx=None):
         while self.grid_layout.count():
             self.grid_layout.takeAt(0)
-
-        cams = list(self.cells.values())
-        if not cams:
-            return
-
-        sel = self.cells.get(getattr(self, 'selected_cam_id', None)) or cams[0]
         mode = self.grid_combo.currentIndex()
-
-        # Determine which cells are visible in this layout, hide the rest.
-        # takeAt() only removes the layout item — the widget stays visible at its
-        # old position unless we explicitly hide it (the "ghost grid in 1×1" bug).
-        if mode == 0:
-            visible = [sel]
-        elif mode == 1:
-            visible = cams[:4]
-        elif mode == 2:
-            visible = cams[:9]
-        elif mode == 3:
-            visible = cams[:16]
-        elif mode in (4, 5):
-            visible = cams[:(4 if mode == 4 else 8)]
+        # Equal stretch on the used rows/cols. Without it QGridLayout gives no
+        # extra space to columns covered only by a spanning cell, so the "big"
+        # cell of 1+3 / 1+7 ended up the narrowest one.
+        rows, cols = self._GRID_DIMS.get(mode, (4, 4))
+        for i in range(6):
+            self.grid_layout.setRowStretch(i, 1 if i < rows else 0)
+            self.grid_layout.setColumnStretch(i, 1 if i < cols else 0)
+        placed = []                      # (slot | None, widget, position)
+        if mode == 0:                    # 1×1: the selected camera
+            sel = self._ensure_cell(getattr(self, 'selected_cam_id', None))
+            if sel is None:
+                sel = next((c for c in map(self._ensure_cell, self.slots) if c), None)
+            if sel is not None:
+                placed.append((None, sel, (0, 0, 1, 1)))
         else:
-            visible = cams
-        for c in self.cells.values():
-            if c in visible:
-                c.show()
-            else:
-                c.hide()
-
-        if mode == 0:    # 1×1
-            self.grid_layout.addWidget(sel, 0, 0)
-        elif mode == 1:  # 2×2
-            for i, c in enumerate(cams[:4]):
-                self.grid_layout.addWidget(c, i//2, i%2)
-        elif mode == 2:  # 3×3
-            for i, c in enumerate(cams[:9]):
-                self.grid_layout.addWidget(c, i//3, i%3)
-        elif mode == 3:  # 4×4
-            for i, c in enumerate(cams[:16]):
-                self.grid_layout.addWidget(c, i//4, i%4)
-        elif mode == 4:  # 1+3
-            self.grid_layout.addWidget(sel, 0, 0, 2, 2)
-            others = [c for c in cams if c is not sel]
-            for i, c in enumerate(others[:3]):
-                self.grid_layout.addWidget(c, i, 2)
-        elif mode == 5:  # 1+7
-            self.grid_layout.addWidget(sel, 0, 0, 2, 2)
-            others = [c for c in cams if c is not sel]
-            for i, c in enumerate(others[:7]):
-                row, col = divmod(i, 2)
-                # Right column (2 rows) + bottom row
-                if i < 2:
-                    self.grid_layout.addWidget(c, i, 2)
-                else:
-                    self.grid_layout.addWidget(c, 2, i-2)
+            for i in range(self._SLOT_COUNTS.get(mode, self._MAX_SLOTS)):
+                uid = self.slots[i]
+                w = self._ensure_cell(uid) if uid else None
+                placed.append((i, w or self._empty_slot(i), self._slot_pos(mode, i)))
+        self._slot_at = {}
+        self._placed_cells = []
+        shown = []
+        for i, w, (r, c, rs, cs) in placed:
+            self.grid_layout.addWidget(w, r, c, rs, cs)
+            w.show()
+            shown.append(w)
+            if i is not None:
+                self._slot_at[w] = i
+            if isinstance(w, VideoCell):
+                self._placed_cells.append(w)
+        # Hide everything else living in the grid: takeAt() only removes the
+        # layout item, the widget would stay painted at its old position.
+        for w in list(self.cells.values()) + self._empty_widgets:
+            if w not in shown:
+                w.hide()
 
     def _grid_drag_enter(self, e):
         if e.mimeData().hasText():
             e.acceptProposedAction()
 
+    def _slot_from_pos(self, pos):
+        w = self.grid_widget.childAt(pos)
+        while w is not None and w is not self.grid_widget:
+            if w in self._slot_at:
+                return self._slot_at[w]
+            w = w.parentWidget()
+        return None
+
     def _grid_drop(self, e):
+        """Drop a camera (from the list or from another cell) onto a cell."""
         uid = e.mimeData().text()
-        if uid not in self.cells:
+        if self._camera(uid) is None:
             return
-        cell = self.cells[uid]
+        e.acceptProposedAction()
         if self.grid_combo.currentIndex() == 0:
-            # Already in 1×1 → make this the single shown camera
-            self.select_camera(uid)
-            if not cell._streaming:
-                cell.start_stream(self._should_use_sub())
-        else:
-            # Multi-view (2×2, 3×3, …): just start this camera in its own cell;
-            # do NOT collapse to 1×1.
-            if not cell._streaming:
-                cell.start_stream(self._should_use_sub())
+            self.select_camera(uid)      # 1×1: show (and start) the dropped camera
+            return
+        slot = self._slot_from_pos(e.pos())
+        if slot is None:
+            return
+        self._place(slot, uid)
+        self.select_camera(uid, promote=False)
+        cell = self.cells.get(uid)
+        if cell is not None and not cell._streaming:
+            cell.start_stream(self._should_use_sub())
 
     def start_all(self):
+        """Start every camera that is on screen in the current layout."""
         sub = self._should_use_sub()
-        for cell in self.cells.values():
+        for cell in list(self._placed_cells):
             cell.start_stream(sub)
         self._apply_live_audio()
 
     def stop_all(self):
         self._audio_player.stop()
+        self._resume.clear()
         for cell in self.cells.values():
             cell.stop_stream()
 
@@ -2988,11 +3391,24 @@ class PlaybackTab(QWidget):
         left.addWidget(self.rec_list)
         left.setStretch(2, 1)
 
-        main.addLayout(left, 1)
+        self.pb_left_panel = QWidget()
+        self.pb_left_panel.setLayout(left)
 
         # ── Desno: video + timeline + controls ───────────────
         right = QVBoxLayout()
         right.setSpacing(8)
+
+        # Collapse toggle for the search panel — one click hides the whole
+        # recordings list to widen the video (the splitter also drags it).
+        pb_hdr = QHBoxLayout()
+        self.btn_pb_panel = QPushButton('◀')
+        self.btn_pb_panel.setToolTip('Hide the search panel (widen video)')
+        self.btn_pb_panel.setFixedSize(26, 22)
+        self.btn_pb_panel.setStyleSheet('font-size:13px;font-weight:700;padding:0;')
+        self.btn_pb_panel.clicked.connect(self._toggle_pb_panel)
+        pb_hdr.addWidget(self.btn_pb_panel)
+        pb_hdr.addStretch()
+        right.addLayout(pb_hdr)
 
         self.video_label = ZoomableVideoLabel('Select a recording to play')
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -3089,13 +3505,35 @@ class PlaybackTab(QWidget):
         pb_ctrl.addWidget(self.speed_combo)
         right.addLayout(pb_ctrl)
 
-        main.addLayout(right, 3)
+        right_panel = QWidget()
+        right_panel.setLayout(right)
+
+        # Draggable divider: shrink/hide the search panel to widen the video.
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.pb_left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, False)
+        splitter.setHandleWidth(6)
+        splitter.setSizes([300, 900])
+        self.pb_splitter = splitter
+        main.addWidget(splitter)
 
         # Timer za progress (svaka sekunda)
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick_progress)
         self._elapsed_s = 0.0
         self.fps = 25.0
+
+    def _toggle_pb_panel(self):
+        show = self.pb_left_panel.isHidden()
+        self.pb_left_panel.setVisible(show)
+        self.btn_pb_panel.setText('◀' if show else '▶')
+        self.btn_pb_panel.setToolTip(
+            'Hide the search panel (widen video)' if show
+            else 'Show the search panel')
 
     def set_cameras(self, cameras, nvr_map=None):
         self.cameras  = cameras
@@ -3265,8 +3703,16 @@ class PlaybackTab(QWidget):
         spd = speed_override if speed_override is not None else \
               self._speeds[self.speed_combo.currentIndex()]
 
+        if getattr(nvr, 'device_type', '') == 'hikconnect':
+            # Cloud replay of the NVR's own recording; seek = start later.
+            rec_end_dt = self._rec_start_dt + timedelta(seconds=self._rec_dur_s)
+            dlog('Playback', f'CLOUD ch={real_cam_id} {play_start_dt:%H:%M:%S}→{rec_end_dt:%H:%M:%S}')
+            self.worker = VideoWorker(
+                'playback', '', speed=spd, decode_w=1280, decode_h=720,
+                cloud_source=nvr.playback_source(real_cam_id, play_start_dt, rec_end_dt))
+            self.worker._file_base_offset_s = self._seek_offset_s
         # SDK is preferred for playback — avoids RTSP bandwidth (453) errors entirely
-        if _SDK and nvr.sdk_user_id >= 0:
+        elif _SDK and nvr.sdk_user_id >= 0:
             rec_end_dt = self._rec_start_dt + timedelta(seconds=self._rec_dur_s)
             # iVMS-style seek: when seeking, START the SDK download AT the seek
             # point (not the recording's beginning). The file then begins at the
@@ -3474,9 +3920,11 @@ class PlaybackTab(QWidget):
             w.set_volume(self._volume)
 
     def _relaunch_audio(self):
-        """Apply the current mute/volume to live playback. Audio routing is baked
-        into the ffmpeg command, so relaunch it at the current position — locally
-        (no re-download) when the file is available, else restart the recording."""
+        """Apply the current mute/volume to playback. Audio routing is baked into
+        the ffmpeg command at launch, so the worker's audio flags (set below) are
+        picked up automatically the next time ffmpeg starts. When playback is
+        already running on a local file, relaunch ffmpeg locally (no re-download)
+        so the change takes effect immediately."""
         w = self.worker
         if w is None:
             return
@@ -3484,10 +3932,15 @@ class PlaybackTab(QWidget):
         cur_offset = max(0.0, self._elapsed_s)
         if self._can_local_relaunch(cur_offset):
             self._local_seek_current(cur_offset)
-        else:
+        elif getattr(w, 'sdk_source', None) is None:
+            # RTSP-fallback playback (no local download file): a relaunch is the
+            # only way to apply audio, and there is no SDK download to collide with.
             row = self.rec_list.currentRow()
             if row >= 0:
                 self._play_recording(row, seek_offset_s=cur_offset)
+        # else: an SDK download is still buffering. The flags set above take
+        # effect when its ffmpeg launches — starting a fresh download here would
+        # race the in-flight one (0KB files) and previously crashed the app.
 
     def _on_mute_toggled(self):
         self._audio_on = not self._audio_on
@@ -3821,6 +4274,94 @@ class ManualRTSPDialog(QWidget):
         self.close()
 
 
+class HikConnectDialog(QWidget):
+    """Add / edit a Hik-Connect cloud account."""
+    saved   = pyqtSignal(object)        # emits HikConnectClient
+    _result = pyqtSignal(bool, str)     # worker thread → UI thread
+
+    def __init__(self, client=None, parent=None):
+        super().__init__(parent, Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setWindowTitle('Hik-Connect account' if client is None
+                            else 'Edit Hik-Connect account')
+        self.setFixedWidth(380)
+        self._client = client
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(8)
+        lay.addWidget(QLabel('Name:'))
+        self.f_name = QLineEdit(client.name if client else 'Hik-Connect')
+        lay.addWidget(self.f_name)
+        lay.addWidget(QLabel('Account (email or phone):'))
+        self.f_account = QLineEdit(client.account if client else '')
+        lay.addWidget(self.f_account)
+        lay.addWidget(QLabel('Password:'))
+        self.f_pass = QLineEdit()
+        self.f_pass.setEchoMode(QLineEdit.Password)
+        if client and client.password_md5:
+            self.f_pass.setPlaceholderText('(unchanged)')
+        lay.addWidget(self.f_pass)
+        hint = QLabel('Cameras are streamed through the Hikvision cloud, like the '
+                      'mobile app — no IP or port forwarding needed. Only a hash '
+                      'of the password is stored. If login asks for a CAPTCHA, '
+                      'sign in once in the official app first.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f'color:{DARK["dim"]};font-size:11px;')
+        lay.addWidget(hint)
+        self.btn = QPushButton('Sign in')
+        self.btn.setStyleSheet(f'background:{DARK["accent"]};color:white;'
+                               f'font-weight:600;padding:8px;')
+        self.btn.clicked.connect(self._sign_in)
+        lay.addWidget(self.btn)
+        self.lbl = QLabel('')
+        self.lbl.setWordWrap(True)
+        self.lbl.setStyleSheet('font-size:12px;')
+        lay.addWidget(self.lbl)
+        self._result.connect(self._on_result)
+        self._pending = None
+
+    def _sign_in(self):
+        import uuid
+        account = self.f_account.text().strip()
+        password = self.f_pass.text()
+        if not account or not (password or (self._client and self._client.password_md5)):
+            self.lbl.setText('Enter account and password')
+            return
+        c = HikConnectClient(self._client.device_id if self._client else str(uuid.uuid4()))
+        c.name = self.f_name.text().strip() or 'Hik-Connect'
+        c.account = account
+        if password:
+            import hik_cloud
+            c.password_md5 = hik_cloud.md5_password(password)
+        else:
+            c.password_md5 = self._client.password_md5
+        if self._client and self._client.account == account:
+            c.api_base = self._client.api_base
+            c.client_version = self._client.client_version
+        self._pending = c
+        self.btn.setText('Signing in…')
+        self.btn.setEnabled(False)
+        threading.Thread(target=lambda: self._result.emit(*c.test()),
+                         daemon=True).start()
+
+    def _on_result(self, ok, msg):
+        self.btn.setText('Sign in')
+        self.btn.setEnabled(True)
+        if not ok:
+            self.lbl.setText(f'✗ {msg}')
+            self.lbl.setStyleSheet(f'font-size:12px;color:{DARK["red"]};')
+            return
+        c = self._pending
+        if self._client is not None:      # edit in place: keep the same object
+            o = self._client
+            o.name, o.account, o.password_md5 = c.name, c.account, c.password_md5
+            o.api_base, o._cloud, o._cams = c.api_base, c._cloud, c._cams
+            c = o
+        self.lbl.setText(f'✓ {msg}')
+        self.lbl.setStyleSheet(f'font-size:12px;color:{DARK["green"]};')
+        self.saved.emit(c)
+        self.close()
+
+
 class DeviceDialog(QWidget):
     """Floating panel to add or edit an NVR device"""
     saved = pyqtSignal(object)   # emits NVRClient
@@ -4027,9 +4568,18 @@ class MainWindow(QMainWindow):
         sb.setContentsMargins(10,14,10,14)
         sb.setSpacing(6)
 
+        logo_row = QHBoxLayout()
         logo = QLabel('📹  HIK MONITOR')
         logo.setStyleSheet(f'color:{DARK["accent"]};font-size:15px;font-weight:700;letter-spacing:1px;')
-        sb.addWidget(logo)
+        btn_collapse = QPushButton('«')
+        btn_collapse.setToolTip('Collapse sidebar (mini mode)')
+        btn_collapse.setFixedSize(26, 24)
+        btn_collapse.setStyleSheet('font-size:16px;font-weight:700;padding:0;')
+        btn_collapse.clicked.connect(lambda: self._set_sidebar_mini(True))
+        logo_row.addWidget(logo)
+        logo_row.addStretch()
+        logo_row.addWidget(btn_collapse)
+        sb.addLayout(logo_row)
 
         # Devices section
         dev_hdr = QHBoxLayout()
@@ -4094,7 +4644,61 @@ class MainWindow(QMainWindow):
         )
         sb.addWidget(kofi)
 
+        self.sidebar = sidebar
         root.addWidget(sidebar)
+
+        # Mini rail — the sidebar collapsed to a thin strip. Just an expand
+        # button plus miniature support icons, so the video area gets almost the
+        # full window width. Only one of {sidebar, mini_rail} is visible at once.
+        self.mini_rail = QWidget()
+        self.mini_rail.setFixedWidth(46)
+        self.mini_rail.setStyleSheet(
+            f'background:{DARK["panel"]};border-right:1px solid {DARK["border"]};')
+        mr = QVBoxLayout(self.mini_rail)
+        mr.setContentsMargins(6, 14, 6, 14)
+        mr.setSpacing(8)
+        btn_expand = QPushButton('☰')
+        btn_expand.setToolTip('Expand sidebar')
+        btn_expand.setFixedSize(34, 30)
+        btn_expand.setStyleSheet('font-size:16px;font-weight:700;padding:0;')
+        btn_expand.clicked.connect(lambda: self._set_sidebar_mini(False))
+        mr.addWidget(btn_expand, alignment=Qt.AlignHCenter)
+
+        # Camera shortcuts — compact per-camera buttons so cameras can be
+        # switched without expanding the sidebar (📷 + first letters; full name
+        # in the tooltip). Scrolls when there are more cameras than fit.
+        cam_scroll = QScrollArea()
+        cam_scroll.setWidgetResizable(True)
+        cam_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cam_scroll.setFrameShape(QFrame.NoFrame)
+        cam_scroll.setStyleSheet('background:transparent;')
+        cam_host = QWidget()
+        self._mini_cam_box = QVBoxLayout(cam_host)
+        self._mini_cam_box.setContentsMargins(0, 0, 0, 0)
+        self._mini_cam_box.setSpacing(5)
+        self._mini_cam_box.addStretch()
+        cam_scroll.setWidget(cam_host)
+        mr.addWidget(cam_scroll, 1)
+
+        mini_coffee = QPushButton('☕')
+        mini_coffee.setToolTip('Support development — Buy me a coffee')
+        mini_coffee.setFixedSize(34, 30)
+        mini_coffee.setStyleSheet(
+            'background:#FFDD00;color:#0d1117;border-radius:6px;font-size:15px;padding:0;')
+        mini_coffee.clicked.connect(
+            lambda: webbrowser.open('https://buymeacoffee.com/manutdsnake'))
+        mr.addWidget(mini_coffee, alignment=Qt.AlignHCenter)
+        mini_kofi = QPushButton('❤')
+        mini_kofi.setToolTip('Support development — Ko-fi')
+        mini_kofi.setFixedSize(34, 30)
+        mini_kofi.setStyleSheet(
+            'background:#FF5E5B;color:white;border-radius:6px;font-size:14px;padding:0;')
+        mini_kofi.clicked.connect(lambda: webbrowser.open('https://ko-fi.com/manutdsnake'))
+        mr.addWidget(mini_kofi, alignment=Qt.AlignHCenter)
+        self.mini_rail.hide()
+        root.addWidget(self.mini_rail)
+
+        self._sidebar_mini = False   # user's manual collapse preference
 
         # Main tabs
         self.tabs = QTabWidget()
@@ -4103,6 +4707,10 @@ class MainWindow(QMainWindow):
         self.pb_tab._live_tab_ref = self.live_tab
         self.tabs.addTab(self.live_tab, '  Live View  ')
         self.tabs.addTab(self.pb_tab,   '  Playback  ')
+        # Playback has its own camera picker; the sidebar's camera list would
+        # switch back to Live View and confuse users — so hide the whole menu on
+        # Playback and restore it (full or mini) when returning to Live View.
+        self.tabs.currentChanged.connect(lambda _: self._update_sidebar_visibility())
         root.addWidget(self.tabs)
 
         self.status = QStatusBar()
@@ -4115,6 +4723,54 @@ class MainWindow(QMainWindow):
         ready = [d for d in self.devices if d.host]
         if ready:
             QTimer.singleShot(600, self._connect_all)
+
+    # ── Sidebar collapse / mini mode ───────────────────────────
+    def _set_sidebar_mini(self, mini):
+        """Remember the user's collapse choice and apply it (unless Playback is
+        currently forcing the menu hidden)."""
+        self._sidebar_mini = bool(mini)
+        self._update_sidebar_visibility()
+
+    def _update_sidebar_visibility(self):
+        on_playback = (self.tabs.currentWidget() is self.pb_tab)
+        if on_playback:
+            self.sidebar.hide()
+            self.mini_rail.hide()
+        elif self._sidebar_mini:
+            self.sidebar.hide()
+            self.mini_rail.show()
+        else:
+            self.sidebar.show()
+            self.mini_rail.hide()
+
+    def _refresh_mini_cameras(self):
+        """Rebuild the mini rail's per-camera shortcut buttons from the current
+        camera list, so the collapsed sidebar can still switch cameras."""
+        box = self._mini_cam_box
+        while box.count():                    # clear old buttons + trailing stretch
+            item = box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for cam in self._all_cameras:
+            uid  = cam.get('uid', cam['id'])
+            name = cam.get('name', '?')
+            btn  = QPushButton(f'📷\n{name[:3]}')
+            btn.setToolTip(name)
+            btn.setFixedSize(34, 40)
+            btn.setStyleSheet(
+                f'font-size:11px;padding:0;color:{DARK["green"]};')
+            btn.clicked.connect(lambda _=False, u=uid: self._mini_select_camera(u))
+            box.addWidget(btn, alignment=Qt.AlignHCenter)
+        box.addStretch()
+
+    def _mini_select_camera(self, uid):
+        """Same as clicking a camera in the full list: select it on Live View."""
+        nvr = self._nvr_map.get(uid)
+        if nvr:
+            self.live_tab.nvr = nvr
+        self.live_tab.select_camera(uid)
+        self.tabs.setCurrentIndex(0)   # make sure we're on Live View
 
     # ── Devices ────────────────────────────────────────────────
     def _refresh_device_list(self):
@@ -4133,6 +4789,7 @@ class MainWindow(QMainWindow):
         a_nvr   = m.addAction('NVR  (Hikvision / Safire)…')
         a_onvif = m.addAction('Scan ONVIF network…')
         a_rtsp  = m.addAction('Manual RTSP URL…')
+        a_cloud = m.addAction('Hik-Connect account (cloud)…')
         btn = self.sender()
         pos = btn.mapToGlobal(btn.rect().bottomLeft()) if btn else self.cursor().pos()
         act = m.exec_(pos)
@@ -4146,6 +4803,8 @@ class MainWindow(QMainWindow):
             self._scan_onvif()
         elif act == a_rtsp:
             self._add_manual_rtsp()
+        elif act == a_cloud:
+            self._add_hikconnect()
 
     def _maybe_offer_sdk(self):
         """If the native Hikvision SDK isn't loaded, offer to download+install
@@ -4175,6 +4834,11 @@ class MainWindow(QMainWindow):
 
     def _add_manual_rtsp(self):
         dlg = ManualRTSPDialog(self)
+        dlg.saved.connect(self._on_device_saved)
+        dlg.show()
+
+    def _add_hikconnect(self):
+        dlg = HikConnectDialog(None, self)
         dlg.saved.connect(self._on_device_saved)
         dlg.show()
 
@@ -4247,8 +4911,14 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f'[{nvr.name}] connecting...')
                 threading.Thread(target=self._connect_device, args=(nvr,), daemon=True).start()
         elif action == edit_action:
-            dlg = DeviceDialog(nvr, self)
-            dlg.saved.connect(lambda n: (NVRClient.save_all(self.devices), self._refresh_device_list()))
+            if getattr(nvr, 'device_type', '') == 'hikconnect':
+                dlg = HikConnectDialog(nvr, self)
+            else:
+                dlg = DeviceDialog(nvr, self)
+            if getattr(nvr, 'device_type', '') == 'hikconnect':
+                dlg.saved.connect(self._on_device_saved)   # re-list cameras
+            else:
+                dlg.saved.connect(lambda n: (NVRClient.save_all(self.devices), self._refresh_device_list()))
             dlg.show()
         elif action == remove_action:
             self._disconnect_device(nvr)
@@ -4340,6 +5010,7 @@ class MainWindow(QMainWindow):
         live_cams = [{**c, 'id': c.get('uid', c['id'])} for c in self._all_cameras]
         self.live_tab.set_cameras(live_cams)
         self.pb_tab.set_cameras(live_cams, self._nvr_map)
+        self._refresh_mini_cameras()
 
     def _cam_clicked(self, item, column=0):
         uid = item.data(0, Qt.UserRole)
@@ -4478,6 +5149,18 @@ if __name__ == '__main__':
     if DEBUG:
         log('APP', 'Debug logging ON (HIK_DEBUG=1). Stats every 3s.')
     _STATS.start()
+    # PyQt5 calls qFatal() → abort() on any unhandled exception raised inside a
+    # slot (e.g. a button click), which kills the whole process. Route unhandled
+    # exceptions through a hook that logs the traceback and keeps the app alive.
+    import traceback
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log('ERROR', 'Unhandled exception (app kept alive):\n' +
+            ''.join(traceback.format_exception(exc_type, exc_value, exc_tb)).rstrip())
+    sys.excepthook = _excepthook
+
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE)
     app.setStyle('Fusion')

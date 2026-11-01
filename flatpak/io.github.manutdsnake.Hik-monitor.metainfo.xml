@@ -23,9 +23,10 @@
     <ul>
       <li>Live view with 1x1, 2x2, 3x3, 4x4, 1+3 and 1+7 grid layouts</li>
       <li>Recording search and playback with timeline scrubbing and speed control</li>
-      <li>Multi-NVR support and drag-and-drop cameras into grid cells</li>
+      <li>Multi-NVR support; drag any camera into any grid cell</li>
       <li>GPU-accelerated playback via VAAPI when available</li>
       <li>ONVIF discovery and manual RTSP — work without any vendor SDK</li>
+      <li>Hik-Connect cloud sign-in: live view and recording playback without port forwarding</li>
     </ul>
     <p>
       Live view and playback for native Hikvision devices use the proprietary
@@ -60,6 +61,17 @@
   </screenshots>
 
   <releases>
+    <release version="1.1.0" date="2026-11-01">
+      <description>
+        <p>Hik-Connect cloud support and a more flexible live grid.</p>
+        <ul>
+          <li>Sign in with a Hik-Connect account: live view and recording playback without port forwarding</li>
+          <li>Drag any camera into any grid cell; improved 1+3 and 1+7 layouts</li>
+          <li>Collapsible sidebar and playback search panel</li>
+          <li>Flatpak: the device list and the downloaded Hikvision SDK are kept across restarts</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-06-29">
       <description>
         <p>First Flatpak release.</p>

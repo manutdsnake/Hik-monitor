@@ -9,8 +9,10 @@ I wrote it for my own NVR because iVMS-4200 has no proper Linux build.
 
 - Live view with 1×1, 2×2, 3×3, 4×4, 1+3 and 1+7 grid layouts
 - Recording playback with timeline scrubbing and 0.25×–8× speed
-- Multiple NVRs, drag-and-drop cameras into grid cells
+- Multiple NVRs, drag any camera into any grid cell
 - Native Hikvision/Safire (HCNetSDK), generic ONVIF, and manual RTSP
+- Hik-Connect cloud: sign in with your Hik-Connect account and watch live view
+  and recordings from anywhere — no port forwarding, no SDK
 - GPU-accelerated decoding via VAAPI when available
 - Dark theme
 
@@ -41,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/instal
 sudo apt install ffmpeg python3 python3-pip python3-venv
 git clone https://github.com/manutdsnake/Hik-monitor.git
 cd Hik-monitor
-pip install PyQt5 requests opencv-python numpy
+pip install PyQt5 requests opencv-python numpy pycryptodome pyezvizapi
 python3 hik_monitor2.py
 ```
 
@@ -52,9 +54,28 @@ Click **+** in the sidebar to add a device:
 - **NVR (Hikvision / Safire)** — IP, port, username, password
 - **Scan ONVIF network** — auto-discover ONVIF cameras
 - **Manual RTSP URL** — anything else
+- **Hik-Connect account (cloud)** — the email/phone and password you use in the
+  Hik-Connect mobile app
 
 Click **Save**, then **Connect All**. Cameras appear in the sidebar; click or drag
 them into the grid to start streaming.
+
+## Hik-Connect cloud
+
+Devices on your Hik-Connect account can be viewed through the Hikvision cloud
+relay, the same way the mobile app does it: live view (main and sub stream,
+H.264/H.265), recording search and playback from the NVR's disk, and cloud
+snapshots. Useful for an NVR at another location without a VPN or open ports.
+
+- It uses the unofficial Hik-Connect API — it may break if Hikvision changes it.
+  Use it with your own account and devices.
+- Only an MD5 hash of the password is stored (that is all the API ever receives).
+- If sign-in asks for a CAPTCHA, log in once in the official app, then retry.
+- Devices with video encryption enabled are not supported yet.
+
+The cloud stream transport comes from [pyezvizapi](https://pypi.org/project/pyezvizapi/)
+(Apache-2.0); parts of the REST and RTP handling are adapted from
+[hikcloudstream](https://pypi.org/project/hikcloudstream/) (Apache-2.0).
 
 ## Hikvision SDK
 
@@ -70,8 +91,8 @@ the auto-install location.
 
 | Device | Status |
 |---|---|
-| DS-7604NI-K1/4P | Working |
-| DS-7608NI-Q1 | Working |
+| DS-7604NI-K1/4P | Working (LAN + Hik-Connect) |
+| DS-7608NI-Q1 | Working (LAN + Hik-Connect) |
 | Safire SF-NVR3104-W (Hikvision-OEM) | Playback |
 | O-KAM / generic ONVIF | Working |
 

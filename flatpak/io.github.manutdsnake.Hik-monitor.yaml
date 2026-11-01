@@ -28,6 +28,8 @@ modules:
   #
   #   flatpak-pip-generator --runtime=org.kde.Sdk//5.15-25.08 \
   #       opencv-python-headless numpy requests   (NOT PyQt5 — from BaseApp)
+  #   + pycryptodome, pyezvizapi (--no-deps) for Hik-Connect cloud — appended
+  #     by hand at the end of python3-modules.yaml
   #
   # NOTE: use opencv-python-HEADLESS (not opencv-python) — the GUI build bundles
   # its own Qt and clashes with PyQt5.
@@ -41,6 +43,7 @@ modules:
       - install -Dm644 hik_sdk.py       /app/share/hik-monitor/hik_sdk.py
       - install -Dm644 hik_play.py      /app/share/hik-monitor/hik_play.py
       - install -Dm644 onvif_client.py  /app/share/hik-monitor/onvif_client.py
+      - install -Dm644 hik_cloud.py     /app/share/hik-monitor/hik_cloud.py
       - install -Dm644 sdk_installer.py /app/share/hik-monitor/sdk_installer.py
       - install -Dm644 LICENSE /app/share/licenses/io.github.manutdsnake.Hik-monitor/LICENSE
       - install -Dm755 flatpak/hik-monitor.sh /app/bin/hik-monitor
