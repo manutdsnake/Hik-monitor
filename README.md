@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/manutdsnake/Hik-monitor/main/instal
 sudo apt install ffmpeg python3 python3-pip python3-venv
 git clone https://github.com/manutdsnake/Hik-monitor.git
 cd Hik-monitor
-pip install PyQt5 requests opencv-python numpy
+pip install PyQt5 requests opencv-python numpy pycryptodome pyezvizapi
 python3 hik_monitor2.py
 ```
 

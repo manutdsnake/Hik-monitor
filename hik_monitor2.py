@@ -27,6 +27,10 @@ def _bootstrap_sdk_path():
             sdk_path = alt
         else:
             return   # no SDK installed — app will run ONVIF/RTSP-only
+    # hik_sdk / hik_play load the libraries from HIKVISION_SDK_PATH (else
+    # ~/Desktop/sdk/lib). Without this the auto-installed SDK (Flatpak) was
+    # found here but not loaded after the first restart.
+    os.environ.setdefault('HIKVISION_SDK_PATH', sdk_path)
     com_path = os.path.join(sdk_path, 'HCNetSDKCom')
     parts = (os.environ.get('LD_LIBRARY_PATH', '') or '').split(':')
     if sdk_path in parts:
@@ -223,6 +227,12 @@ from PyQt5.QtGui import (
 
 # ── Konfiguracija ──────────────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / '.hikvision_monitor.json'
+if os.environ.get('FLATPAK_ID') or os.path.exists('/.flatpak-info'):
+    # In the Flatpak sandbox $HOME is a throwaway tmpfs, so the device list was
+    # lost on every restart. Use the app's persistent config dir instead
+    # (~/.var/app/<id>/config). Native installs keep the file above.
+    CONFIG_FILE = Path(os.environ.get('XDG_CONFIG_HOME')
+                       or Path.home() / '.config') / 'hik-monitor' / 'devices.json'
 
 DARK = {
     'bg':       '#0d1117',
@@ -380,6 +390,7 @@ class NVRClient:
         # Holds credentials → owner-only (0600), and atomic (temp + replace)
         # so a crash mid-write can't leave a truncated file behind.
         data = json.dumps({'devices': [c.to_dict() for c in clients]}, indent=2)
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + '.tmp')
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
