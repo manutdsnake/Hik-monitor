@@ -79,6 +79,43 @@ snapshots. Useful for an NVR at another location without a VPN or open ports.
   login, readable only by you) and works for live view, playback and previews.
   Tested with an H.265 NVR; H.264 devices use the same scheme but are untested.
 
+### Web viewer
+
+`hik_web` serves the same Hik-Connect cameras to a browser, so you can watch from a
+phone or another computer without installing anything there:
+
+```bash
+pip install -r requirements-web.txt
+python3 -m hik_web                     # http://127.0.0.1:8765
+```
+
+- Live grid with a one-camera focus view, saving a frame as a picture, and full screen.
+  The **Fast / Quality** switch picks the stream: *Fast* (default) uses the cameras'
+  small sub-streams everywhere for the quickest start and the lowest delay; *Quality*
+  shows the focus view from the full-HD main stream (the grid still uses sub-streams).
+- Live video goes to the browser as fragmented MP4 over a WebSocket (about half a
+  second or so behind real time); browsers without Media Source fall back to HLS
+  (`/?hls=1` forces that).
+- Recordings from the NVR's disk: pick a day, click the timeline (24 h, or zoom to 6 h /
+  1 h), or type a time and press *Go to time*. Jump ±10 s / ±1 min / ±10 min (moves inside
+  already-loaded footage are instant), start of day, latest, 0.25× / 0.5× / 1× speed,
+  frame-by-frame, save a frame, keyboard shortcuts (space, arrows, `,` `.` `[` `]`, G, I, O,
+  S, F), and clip download (no re-encode, up to 30 minutes).
+- The NVR sends a recording in real time and allows only two playbacks at once, so there is
+  no faster-than-1× playback; use the jump buttons and the timeline instead.
+- Nothing streams in the background. A camera is only pulled from the cloud while a
+  browser has it open, and sessions close a few seconds after the page goes away.
+- It reads the same config file as the desktop app (`~/.hikvision_monitor.json`, or
+  `HIK_CONFIG`), including the per-device verification codes; the browser never sees
+  the login or the codes. If a device needs its code, the page asks for it once.
+- Video is transcoded to H.264 because most browsers cannot play H.265.
+- The cloud relay delivers recordings at real-time speed, so a clip takes about as long
+  as the clip itself.
+
+It listens on `127.0.0.1` only. To reach it from other devices, put it behind a VPN
+such as Tailscale (`tailscale serve --bg 8765`), and set `HIK_WEB_PASSWORD` to add a
+password prompt. Do not expose it to the internet.
+
 The cloud stream transport comes from [pyezvizapi](https://pypi.org/project/pyezvizapi/)
 (Apache-2.0); parts of the REST and RTP handling are adapted from
 [hikcloudstream](https://pypi.org/project/hikcloudstream/) (Apache-2.0).

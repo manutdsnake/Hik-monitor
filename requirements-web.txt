@@ -1,0 +1,2 @@
+aiohttp>=3.9
+# also needs: ffmpeg on PATH, and the Hik-Connect packages from the main README (requests, pycryptodome, pyezvizapi)
