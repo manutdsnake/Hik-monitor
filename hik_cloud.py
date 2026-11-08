@@ -501,6 +501,9 @@ def _judge_param_set(nal, codec=None):
     return None
 
 
+_G711_PTS = (0, 8)          # RTP payload types: PCMU (µ-law), PCMA (A-law)
+
+
 # ── RTP video depacketizer (H.264 + H.265) ─────────────────────────────────
 # Idea and parameter-set handling adapted from hikcloudstream (Apache-2.0).
 # The VTM stream mixes several RTP payload types (video, G.711 audio, a Hik
@@ -522,6 +525,8 @@ class _RtpVideoDepacketizer:
         self._ts = None          # RTP timestamp of the current frame
         self._frame_ts = []      # the first frames' RTP timestamps, for fps
         self._frame_flagged = False
+        self.on_audio = None     # callable(payload type, G.711 bytes), set once streaming
+        self._audio_aes = None
 
     @property
     def fps(self):
@@ -563,6 +568,10 @@ class _RtpVideoDepacketizer:
             return []
         if not p:
             return []
+        if pt in _G711_PTS:
+            if self.on_audio is not None:
+                self._audio(pt, pkt[0] & 0x10, p)
+            return []
         if self.pt is None:
             # Never detect video on static (G.711 audio…) or Hik-private (112)
             # payload types: their first byte can look like an SPS by chance.
@@ -588,6 +597,29 @@ class _RtpVideoDepacketizer:
         if self._frame_flagged and self.encrypted is not False:
             nals = list(map(self._decrypt, nals))
         return [o for o in map(self._inject, nals) if o]
+
+    def _audio(self, pt, flagged, p):
+        """Pass on one G.711 packet (8 kHz, 8-bit samples). With video encryption
+        on, the camera also scrambles its sound: every whole 16-byte block of the
+        packet is AES-ECB encrypted with the same key (measured: the decrypted
+        bytes are smooth audio, the raw ones are noise). Follow the video's
+        verdict: until the video has proved the stream is scrambled and the code
+        is right, hold the sound back rather than play noise."""
+        if flagged and self.key:
+            if self.encrypted is None:
+                return
+            if self.encrypted:
+                if self._audio_aes is None:
+                    from Crypto.Cipher import AES
+                    self._audio_aes = AES.new(self.key, AES.MODE_ECB)
+                n = len(p) // 16 * 16
+                p = self._audio_aes.decrypt(bytes(p[:n])) + bytes(p[n:])
+        elif flagged and self.encrypted is not False:
+            return                                   # scrambled, and no code to unlock it
+        try:
+            self.on_audio(pt, bytes(p))
+        except Exception:
+            pass
 
     def _decrypt(self, nal):
         """Decrypt one NAL (start code included) of a flagged frame. The first
@@ -874,6 +906,15 @@ class CloudLiveStream:
     def fps(self):
         """Frames per second of a live RTP stream, or None if not (yet) known."""
         return self._depay.fps if self._depay is not None else None
+
+    def set_audio_sink(self, fn):
+        """Receive the live sound as ``fn(payload_type, g711_bytes)``, one call per
+        RTP packet (0 = µ-law, 8 = A-law; 8 kHz mono). Only live RTP streams carry
+        it here (the NVR records video only). Returns False when there is none."""
+        if self._depay is None:
+            return False
+        self._depay.on_audio = fn
+        return True
 
     @property
     def _has_video(self):

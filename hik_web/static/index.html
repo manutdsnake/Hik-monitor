@@ -30,6 +30,12 @@
   </div>
 </header>
 
+<div id="login-banner" class="banner" role="alert" hidden>
+  <strong>The server can’t sign in to Hik-Connect.</strong>
+  <span id="login-msg"></span>
+  <span>If you changed your Hik-Connect password, sign in again in the desktop app, then copy <code>~/.hikvision_monitor.json</code> to the server’s <code>deploy/data/hikvision_monitor.json</code>.</span>
+</div>
+
 <div class="shell">
   <aside id="side" aria-label="Cameras">
     <p class="side-title">Cameras</p>
@@ -87,6 +93,7 @@
           <button id="day-start" title="The first footage of this day">Start of day</button>
           <button id="latest" title="The newest footage on this day">Latest</button>
           <button id="save-frame" title="Save the current picture">Save frame</button>
+          <button id="bm-add" title="Remember this moment (B)">Bookmark</button>
         </div>
       </div>
 
@@ -98,7 +105,7 @@
         </div>
         <button id="pan-left" class="icon" aria-label="Show earlier">‹</button>
         <button id="pan-right" class="icon" aria-label="Show later">›</button>
-        <span class="keys">Keys: space play/pause · ← → 10 s (shift 1 min) · , . one frame · [ ] speed · G go to time · I O clip start/end · S save frame · F full screen</span>
+        <span class="keys">Keys: space play/pause · ← → 10 s (shift 1 min) · , . one frame · [ ] speed · G go to time · I O clip start/end · S save frame · B bookmark · F full screen · wheel zoom (0 resets)</span>
       </div>
 
       <div id="tl" class="timeline" tabindex="0" role="slider" aria-label="Recording timeline"
@@ -106,7 +113,16 @@
         <div class="tl-track" id="tl-track"></div>
         <div class="tl-ticks" id="tl-ticks" aria-hidden="true"></div>
       </div>
-      <p class="tl-legend"><i class="sw rec"></i>Recorded <i class="sw clip"></i>Clip range</p>
+      <p class="tl-legend"><i class="sw rec"></i>Recorded <i class="sw gap"></i>Gap (no recording) <i class="sw bm"></i>Bookmark <i class="sw clip"></i>Clip range</p>
+      <p class="tl-gaps" id="tl-gaps"></p>
+
+      <form id="bm-form" class="bm-form" autocomplete="off" hidden>
+        <label class="field"><span>Bookmark <b id="bm-when"></b></span>
+          <input id="bm-note" maxlength="200" placeholder="What happened (optional)">
+        </label>
+        <button type="submit" class="primary">Save bookmark</button>
+        <button type="button" id="bm-cancel" class="ghost">Cancel</button>
+      </form>
 
       <form id="clip" class="clip" autocomplete="off">
         <div class="clip-fields">
@@ -121,6 +137,12 @@
         </div>
         <div class="bar-progress" id="clip-bar" hidden><i></i></div>
       </form>
+
+      <section class="bookmarks" aria-labelledby="bm-title">
+        <h2 id="bm-title">Bookmarks for this camera</h2>
+        <p id="bm-empty" class="muted">None yet. While a recording plays, press Bookmark (or B) to remember the moment.</p>
+        <ul id="bm-list"></ul>
+      </section>
     </section>
   </main>
 </div>
@@ -139,6 +161,14 @@
     </div>
   </form>
 </dialog>
+
+<div id="idle" class="idle" hidden>
+  <div>
+    <h2>Video paused</h2>
+    <p>Nobody has used this page for 30 minutes, so it stopped streaming.</p>
+    <button type="button" id="idle-resume" class="primary">Resume video</button>
+  </div>
+</div>
 
 <div id="toast" role="status" aria-live="polite"></div>
 

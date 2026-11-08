@@ -15,9 +15,9 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } },
 };
 
-async function api(path, body) {
-  const init = body === undefined ? {} : {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+async function api(path, body, method) {
+  const init = body === undefined ? (method ? { method } : {}) : {
+    method: method || 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   };
   const r = await fetch(path, init);
   let data = null;
@@ -41,6 +41,7 @@ function toast(msg) {
 /** Turn relay/server errors into something a person can act on. */
 function friendly(e) {
   const m = (e && e.message) || String(e);
+  if (e && e.data && e.data.auth) { checkStatus(); return 'The server cannot sign in to Hik-Connect.'; }
   if (/6106/.test(m)) return 'No camera is connected to this channel.';
   if (/No recording/i.test(m)) return 'There is no recording at that time.';
   if (/offline/i.test(m)) return 'The device is offline.';
@@ -76,6 +77,86 @@ function saveVideoFrame(video, baseName, when) {
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   }, 'image/jpeg', 0.92);
+}
+
+/* ── digital zoom: mouse wheel zooms in at the pointer, drag moves ───────── */
+class Zoom {
+  /** box: the element that clips the picture; video: the element that is scaled.
+   *  enabled(): whether zooming is allowed right now. onChange(zoomed) is told
+   *  when the picture goes from whole to zoomed or back. */
+  constructor(box, video, { enabled = () => true, onChange = () => {} } = {}) {
+    Object.assign(this, { box, video, enabled, onChange });
+    this.s = 1; this.x = 0; this.y = 0;
+    this.moved = false;
+    this.reset_ = document.createElement('button');
+    this.reset_.type = 'button';
+    this.reset_.className = 'zoom-reset';
+    this.reset_.hidden = true;
+    this.reset_.addEventListener('click', ev => { ev.stopPropagation(); this.reset(); });
+    this.reset_.addEventListener('pointerdown', ev => ev.stopPropagation());
+    box.append(this.reset_);
+    box.addEventListener('wheel', ev => this.onWheel(ev), { passive: false });
+    box.addEventListener('pointerdown', ev => this.onDown(ev));
+    box.addEventListener('dblclick', ev => { if (this.s > 1) { ev.stopPropagation(); ev.preventDefault(); this.reset(); } }, true);
+    // A drag that moved the picture is not a click (a click on a live tile changes the layout).
+    box.addEventListener('click', ev => { if (this.moved) { ev.stopPropagation(); ev.preventDefault(); this.moved = false; } }, true);
+  }
+
+  get zoomed() { return this.s > 1; }
+
+  onWheel(ev) {
+    if (!this.enabled() || ev.ctrlKey) return;      // ctrl+wheel stays the browser's page zoom
+    ev.preventDefault();
+    const r = this.box.getBoundingClientRect();
+    const px = ev.clientX - r.left, py = ev.clientY - r.top;
+    const step = Math.exp(-Math.sign(ev.deltaY) * Math.min(Math.abs(ev.deltaY), 120) / 400);
+    this.zoomAt(px, py, this.s * step);
+  }
+
+  zoomAt(px, py, s) {
+    s = Math.min(8, Math.max(1, s));
+    this.x = px - (px - this.x) * (s / this.s);
+    this.y = py - (py - this.y) * (s / this.s);
+    this.set(s);
+  }
+
+  onDown(ev) {
+    if (this.s <= 1 || ev.button !== 0) return;
+    const sx = ev.clientX, sy = ev.clientY, ox = this.x, oy = this.y;
+    let dragging = false;
+    const move = e => {
+      if (!dragging && Math.hypot(e.clientX - sx, e.clientY - sy) < 4) return;
+      dragging = true; this.moved = true;
+      this.box.classList.add('panning');
+      this.x = ox + e.clientX - sx; this.y = oy + e.clientY - sy;
+      this.set(this.s);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      this.box.classList.remove('panning');
+      if (!dragging) this.moved = false;
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
+  set(s) {
+    const W = this.box.clientWidth, H = this.box.clientHeight;
+    const was = this.s > 1;
+    this.s = s;
+    this.x = Math.min(0, Math.max(W * (1 - s), this.x));       // keep the picture covering the box
+    this.y = Math.min(0, Math.max(H * (1 - s), this.y));
+    if (s <= 1) { this.x = this.y = 0; }
+    this.video.style.transformOrigin = '0 0';
+    this.video.style.transform = s > 1 ? `translate(${this.x}px, ${this.y}px) scale(${s})` : '';
+    this.box.classList.toggle('zoomed', s > 1);
+    this.reset_.hidden = s <= 1;
+    this.reset_.textContent = `Reset zoom (${s.toFixed(1)}×)`;
+    if (was !== s > 1) this.onChange(s > 1);
+  }
+
+  reset() { this.set(1); }
 }
 
 /* ── verification code dialog (one prompt per device) ────────────────────── */
@@ -118,10 +199,57 @@ function askCode(serial, device, wrong) {
 const USE_MSE = !!window.MediaSource && !/[?&]hls=1/.test(location.search) &&
   MediaSource.isTypeSupported('video/mp4; codecs="avc1.640028"');
 
+/* Live sound: the camera's G.711 (8 kHz) packets, played with Web Audio and held
+   back by about as long as the video is behind, so picture and sound line up. */
+const ULAW = new Float32Array(256), ALAW = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  let u = ~i & 0xFF, e = (u >> 4) & 7, m = u & 0x0F;
+  let v = (((m << 3) + 0x84) << e) - 0x84;
+  ULAW[i] = ((u & 0x80) ? -v : v) / 32768;
+  let a = i ^ 0x55; e = (a >> 4) & 7; m = a & 0x0F;
+  v = e === 0 ? (m << 4) + 8 : ((m << 4) + 0x108) << (e - 1);
+  ALAW[i] = ((a & 0x80) ? v : -v) / 32768;
+}
+
+class LiveSound {
+  constructor() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    this.gain = this.ctx.createGain();
+    this.gain.connect(this.ctx.destination);
+    this.next = 0;
+    this.delay = 1.2;                         // seconds; follows the video's lag
+    this.got = 0;
+  }
+
+  /** The video is `lag` seconds behind real time. */
+  setLag(lag) { this.delay += (Math.min(4, Math.max(0.25, lag)) - this.delay) * 0.3; }
+
+  push(buf) {
+    // buf: 'AUD', payload type, samples
+    const bytes = new Uint8Array(buf, 4), table = new Uint8Array(buf, 3, 1)[0] === 8 ? ALAW : ULAW;
+    if (!bytes.length) return;
+    this.got++;
+    const ab = this.ctx.createBuffer(1, bytes.length, 8000), ch = ab.getChannelData(0);
+    for (let i = 0; i < bytes.length; i++) ch[i] = table[bytes[i]];
+    const now = this.ctx.currentTime, target = now + this.delay;
+    // Re-anchor after a gap, or when the schedule has drifted from the video.
+    if (this.next < now + 0.02 || Math.abs(this.next - target) > 0.3) this.next = target;
+    const src = this.ctx.createBufferSource();
+    src.buffer = ab; src.connect(this.gain); src.start(this.next);
+    this.next += ab.duration;
+  }
+
+  close() { try { this.ctx.close(); } catch { /* already closed */ } }
+}
+
+const isAudio = buf => buf.byteLength > 4 && (() => { const b = new Uint8Array(buf, 0, 3); return b[0] === 65 && b[1] === 85 && b[2] === 68; })();
+
 class MsePlayer {
   constructor(video, path, onError) {
     this.video = video;
     this.onError = onError;
+    this.sound = null;
     this.queue = [];
     this.sb = null;
     this.dead = false;
@@ -129,6 +257,7 @@ class MsePlayer {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     this.ws = new WebSocket(`${proto}//${location.host}${path}`);
     this.ws.binaryType = 'arraybuffer';
+    this.ws.onopen = () => { if (this.sound) this.ws.send(JSON.stringify({ audio: true })); };
     this.ws.onmessage = ev => this.onMessage(ev);
     this.ws.onclose = () => this.fatal(new Error('The video connection dropped.'));
   }
@@ -141,6 +270,7 @@ class MsePlayer {
       else this.open(m.mime);
       return;
     }
+    if (isAudio(ev.data)) { if (this.sound) this.sound.push(ev.data); return; }
     this.queue.push(ev.data);
     // A hidden or busy tab can fall behind. Every fragment starts with a keyframe,
     // so dropping the old ones only makes the picture jump forward.
@@ -175,6 +305,10 @@ class MsePlayer {
       const ahead = end - v.currentTime;
       if (ahead > 3 && !v.paused) v.currentTime = end - 0.5;
       else v.playbackRate = ahead > 1.8 ? 1.08 : 1;
+      // How far the picture is behind the sound: a fragment is about a second of
+      // frames sent once complete, so its first frame arrives that old and then
+      // waits behind what is buffered: (end - 1 s) - now + 1 s, plus encoding.
+      if (this.sound) this.sound.setLag(Math.min(ahead, 3) + 0.2);
     }
     const next = this.queue.shift();
     if (!next) return;
@@ -187,6 +321,17 @@ class MsePlayer {
     if (!this.started) { this.started = true; v.play().catch(() => {}); }
   }
 
+  /** Turn the camera's sound on or off (call from a click: browsers only start audio then). */
+  setSound(on) {
+    if (on && !this.sound) {
+      this.sound = new LiveSound();
+      if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ audio: true }));
+    } else if (!on && this.sound) {
+      this.sound.close(); this.sound = null;
+      if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ audio: false }));
+    }
+  }
+
   fatal(e) {
     if (this.dead) return;
     this.destroy();
@@ -195,6 +340,7 @@ class MsePlayer {
 
   destroy() {
     this.dead = true;
+    if (this.sound) { this.sound.close(); this.sound = null; }
     try { this.ws.onclose = null; this.ws.close(); } catch { /* already closed */ }
     this.queue = [];
     if (this.url) URL.revokeObjectURL(this.url);
@@ -223,6 +369,7 @@ class Tile {
       <div class="osd bottom"><time></time></div>
       <div class="status"><div class="spin"></div><div class="msg"></div><button class="ghost retry" hidden>Try again</button></div>
       <div class="tools">
+        <button type="button" data-act="sound" aria-pressed="false" title="Hear this camera (one camera at a time)"${USE_MSE ? '' : ' hidden'}>Sound</button>
         <button type="button" data-act="frame" title="Save this frame as a picture">Save frame</button>
         <button type="button" data-act="full" title="Full screen">Full screen</button>
       </div>`;
@@ -233,9 +380,16 @@ class Tile {
     this.retry = $('.retry', el);
     this.retry.addEventListener('click', ev => { ev.stopPropagation(); this.start(this.quality); });
     $('[data-act="frame"]', el).addEventListener('click', ev => { ev.stopPropagation(); this.saveFrame(); });
+    this.soundBtn = $('[data-act="sound"]', el);
+    this.soundBtn.addEventListener('click', ev => { ev.stopPropagation(); live.setSound(this.soundOn ? null : cam.key); });
+    this.soundOn = false;
     $('[data-act="full"]', el).addEventListener('click', ev => { ev.stopPropagation(); this.fullscreen(); });
     el.setAttribute('aria-label', cam.name);
     this.posterLoaded = false;
+    // Zoom in on the big picture (focus view or full screen), not on the small tiles.
+    this.zoom = new Zoom(el, this.video, {
+      enabled: () => el.classList.contains('main') || document.fullscreenElement === el,
+    });
   }
 
   loadPoster() {
@@ -292,6 +446,7 @@ class Tile {
     v.onplaying = () => { if (token === this.token) { this.retries = 0; this.setState('playing'); } };
     if (r.ws) {
       this.mse = new MsePlayer(v, r.ws, e => { if (token === this.token) this.fail(e, token); });
+      if (this.soundOn) this.mse.setSound(true);
     } else if (window.Hls && Hls.isSupported()) {
       const h = this.hls = newHls({ liveSyncDurationCount: 2, liveMaxLatencyDurationCount: 6, maxBufferLength: 8 });
       h.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
@@ -348,6 +503,22 @@ class Tile {
 
   saveFrame() {
     saveVideoFrame(this.video, this.cam.name, new Date());
+  }
+
+  setSound(on) {
+    this.soundOn = on;
+    this.soundBtn.setAttribute('aria-pressed', String(on));
+    this.soundBtn.textContent = on ? 'Sound on' : 'Sound';
+    this.el.classList.toggle('sound', on);
+    if (this.mse) this.mse.setSound(on);
+    clearTimeout(this.soundCheck);
+    if (on) {
+      // Some cameras have no microphone: say so instead of staying silent.
+      this.soundCheck = setTimeout(() => {
+        const snd = this.mse && this.mse.sound;
+        if (this.soundOn && this.state === 'playing' && snd && !snd.got) toast(`${this.cam.name} is not sending any sound.`);
+      }, 5000);
+    }
   }
 
   fullscreen() {
@@ -454,9 +625,10 @@ const live = {
       const shown = !this.hidden.has(cam.key);
       const main = focusing && cam.key === this.focus;
       t.el.classList.toggle('main', main);
+      if (!main && t.zoom.zoomed && document.fullscreenElement !== t.el) t.zoom.reset();
       t.el.onclick = () => this.tileClicked(cam.key);
       t.el.onkeydown = ev => { if (ev.key === 'Enter' && ev.target === t.el) this.tileClicked(cam.key); };
-      if (!shown) { if (t.state !== 'idle') t.stop(); continue; }
+      if (!shown) { if (t.soundOn) this.setSound(null); if (t.state !== 'idle') t.stop(); continue; }
       if (!t.posterLoaded) t.loadPoster();
       const q = main && this.profile === 'quality' ? 'main' : 'sub';
       if (this.active && (t.state === 'idle' || t.quality !== q)) t.start(q);
@@ -500,7 +672,14 @@ const live = {
   },
 
   start() { this.active = true; this.render(); },
-  stop() { this.active = false; this.tiles.forEach(t => { if (t.state !== 'idle') t.stop(); }); },
+  stop() { this.active = false; this.setSound(null); this.tiles.forEach(t => { if (t.state !== 'idle') t.stop(); }); },
+
+  /** Sound from one camera at a time (key), or none (null). */
+  soundKey: null,
+  setSound(key) {
+    this.soundKey = key;
+    this.tiles.forEach((t, k) => { if (t.soundOn !== (k === key)) t.setSound(k === key); });
+  },
 
   keepAlive() {
     this.tiles.forEach(t => {
@@ -515,6 +694,7 @@ const live = {
 /* ── recordings ──────────────────────────────────────────────────────────── */
 const DAY_MS = 86400000;
 const SPAN_MS = 15 * 60 * 1000;
+const GAP_MIN_MS = 60 * 1000;        // shorter breaks are normal (the NVR splits files)
 const rec = {
   key: null, date: null, blocks: [], serverNow: null,
   cursor: null, speed: 1, tok: 0,
@@ -542,6 +722,9 @@ const rec = {
     $('#day-start').addEventListener('click', () => this.dayStartJump());
     $('#latest').addEventListener('click', () => this.latest());
     $('#save-frame').addEventListener('click', () => this.saveFrame());
+    $('#bm-add').addEventListener('click', () => this.addBookmark());
+    $('#bm-form').addEventListener('submit', ev => { ev.preventDefault(); this.saveBookmark(); });
+    $('#bm-cancel').addEventListener('click', () => { $('#bm-form').hidden = true; });
     $('#goto').addEventListener('submit', ev => { ev.preventDefault(); this.gotoTime($('#goto-time').value); });
     $$('#zoom button').forEach(b => b.setAttribute('aria-pressed', String(Number(b.dataset.zoom) === this.zoom)));
     this.initKeys();
@@ -552,6 +735,7 @@ const rec = {
     v.addEventListener('ended', () => this.onEnded());
     v.addEventListener('loadedmetadata', () => { v.playbackRate = this.speed; });
     v.addEventListener('playing', () => { v.playbackRate = this.speed; this.message(''); });
+    this.zoomer = new Zoom($('#player'), v, { onChange: z => { v.controls = !z; } });
     this.renderTicks();
   },
 
@@ -565,6 +749,7 @@ const rec = {
 
   reset() {
     this.stopSpan();
+    if (this.zoomer) this.zoomer.reset();
     this.cursor = null;
     this.clipStart = this.clipEnd = null;
     $('#clip-start').value = $('#clip-end').value = '';
@@ -584,6 +769,7 @@ const rec = {
     const key = this.key, date = this.date;
     this.blocks = [];
     this.renderTimeline();
+    this.loadBookmarks();
     try {
       const r = await api(`/api/records?key=${encodeURIComponent(key)}&date=${date}`);
       if (key !== this.key || date !== this.date) return;
@@ -596,12 +782,121 @@ const rec = {
         if (last && b - last.e <= 3000) last.e = e > last.e ? e : last.e; else blocks.push({ b, e });
       }
       this.blocks = blocks;
+      this.gaps = this.findGaps(blocks);
       this.loaded = true;
       if (!blocks.length) this.message('No recordings on this day.');
     } catch (e) {
       this.message(friendly(e), true);
     }
     this.renderTimeline();
+    this.renderGaps();
+  },
+
+  /* gaps: stretches inside the recorded part of the day with no footage */
+  gaps: [],
+  findGaps(blocks) {
+    const out = [];
+    for (let i = 1; i < blocks.length; i++) {
+      const b = blocks[i - 1].e, e = blocks[i].b;
+      if (e - b >= GAP_MIN_MS) out.push({ b, e });
+    }
+    return out;
+  },
+
+  renderGaps() {
+    const el = $('#tl-gaps');
+    el.replaceChildren();
+    if (!this.blocks.length) return;
+    const n = this.gaps.length;
+    const dur = ms => { const m = Math.round(ms / 60000); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${pad(m % 60)} min`; };
+    const hm = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    if (!n) { el.textContent = 'No gaps in the recording on this day.'; return; }
+    const total = this.gaps.reduce((t, g) => t + (g.e - g.b), 0);
+    el.append(`${n === 1 ? 'One gap' : `${n} gaps`} in the recording (${dur(total)} missing): `);
+    this.gaps.slice(0, 12).forEach((g, i) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'link';
+      b.textContent = `${hm(g.b)}–${hm(g.e)}`;
+      b.title = `No recording for ${dur(g.e - g.b)}. Click to play from just before it.`;
+      b.addEventListener('click', () => this.playAt(new Date(Math.max(this.dayStart.getTime(), g.b.getTime() - 20000))));
+      if (i) el.append(', ');
+      el.append(b);
+    });
+    if (n > 12) el.append(`, and ${n - 12} more`);
+  },
+
+  /* bookmarks */
+  bookmarks: [],
+  async loadBookmarks() {
+    const key = this.key;
+    try {
+      const list = await api(`/api/bookmarks?key=${encodeURIComponent(key)}`);
+      if (key !== this.key) return;
+      this.bookmarks = list.map(b => ({ ...b, t: new Date(b.time) }));
+    } catch { this.bookmarks = []; }
+    this.renderBookmarks();
+    this.renderTimeline();
+  },
+
+  addBookmark() {
+    if (!this.cursor) { toast('Start playing first, then bookmark the moment.'); return; }
+    this.bmTime = new Date(this.cursor.getTime());
+    $('#bm-when').textContent = `${this.date} ${fmtClock(this.bmTime)}`;
+    $('#bm-note').value = '';
+    $('#bm-form').hidden = false;
+    $('#bm-note').focus();
+  },
+
+  async saveBookmark() {
+    if (!this.bmTime) return;
+    try {
+      await api('/api/bookmarks', { key: this.key, time: iso(this.bmTime), note: $('#bm-note').value.trim() });
+      $('#bm-form').hidden = true;
+      toast(`Bookmarked ${fmtClock(this.bmTime)}.`);
+      this.loadBookmarks();
+    } catch (e) { toast(friendly(e)); }
+  },
+
+  async deleteBookmark(b) {
+    try {
+      await api(`/api/bookmarks/${b.id}`, undefined, 'DELETE');
+      this.loadBookmarks();
+    } catch (e) { toast(friendly(e)); }
+  },
+
+  /** Play a bookmark, switching to its day first if needed. */
+  async gotoBookmark(b) {
+    if (fmtDate(b.t) !== this.date) {
+      this.date = fmtDate(b.t);
+      $('#rec-date').value = this.date;
+      this.stopSpan();
+      this.cursor = null;
+      await this.loadDay();
+    }
+    this.playAt(new Date(Math.max(this.dayStart.getTime(), b.t.getTime() - 5000)));
+  },
+
+  renderBookmarks() {
+    const ul = $('#bm-list');
+    ul.replaceChildren();
+    $('#bm-empty').hidden = this.bookmarks.length > 0;
+    for (const b of [...this.bookmarks].reverse()) {
+      const li = document.createElement('li');
+      const go = document.createElement('button');
+      go.type = 'button'; go.className = 'bm-go';
+      go.innerHTML = '<time></time><span class="note"></span>';
+      $('time', go).textContent = `${fmtDate(b.t) === fmtDate(new Date()) ? 'Today' : fmtDate(b.t)} ${fmtClock(b.t)}`;
+      $('.note', go).textContent = b.note || 'No note';
+      if (!b.note) $('.note', go).classList.add('muted');
+      go.title = 'Play from 5 seconds before this moment';
+      go.addEventListener('click', () => this.gotoBookmark(b));
+      const del = document.createElement('button');
+      del.type = 'button'; del.className = 'icon bm-del'; del.textContent = '×';
+      del.setAttribute('aria-label', `Delete the bookmark at ${fmtClock(b.t)}`);
+      del.addEventListener('click', () => this.deleteBookmark(b));
+      li.append(go, del);
+      ul.append(li);
+    }
   },
 
   enter() {
@@ -677,6 +972,20 @@ const rec = {
       const el = document.createElement('div');
       el.className = 'span';
       place(el, s, e, 0.15);
+    }
+    for (const g of this.gaps) {
+      const s = g.b < w.s ? w.s : g.b, e = g.e > we ? we : g.e;
+      if (e <= s) continue;
+      const el = document.createElement('div');
+      el.className = 'gap';
+      place(el, s, e, 0.15);
+    }
+    for (const b of this.bookmarks) {
+      if (fmtDate(b.t) !== this.date || b.t < w.s || b.t > we) continue;
+      const m = document.createElement('div');
+      m.className = 'bm'; m.style.left = `${this.frac(b.t) * 100}%`;
+      m.title = `${fmtClock(b.t)}${b.note ? ` ${b.note}` : ''}`;
+      track.append(m);
     }
     if (this.clipStart && this.clipEnd && this.clipEnd > this.clipStart) {
       const s = this.clipStart < w.s ? w.s : this.clipStart, e = this.clipEnd > we ? we : this.clipEnd;
@@ -808,6 +1117,8 @@ const rec = {
         'i': () => $('#clip-start-now').click(),
         'o': () => $('#clip-end-now').click(),
         's': () => this.saveFrame(),
+        'b': () => this.addBookmark(),
+        '0': () => this.zoomer.reset(),
         'f': () => { const el = $('#player'); if (document.fullscreenElement) document.exitFullscreen(); else if (el.requestFullscreen) el.requestFullscreen().catch(() => {}); },
       };
       const act = actions[key];
@@ -821,9 +1132,10 @@ const rec = {
     if (this.sid && this.cursor) this.playAt(this.cursor);
   },
 
-  async playAt(t) {
+  async playAt(t, quiet = false) {
     const run = this.runAt(t);
     if (!run) { toast('There is no recording after that time.'); return; }
+    if (run.b > t && !quiet && run.b - t > 3000) toast(`No recording at ${fmtClock(t)}. Playing from ${fmtClock(run.b)}.`);
     const begin = new Date(Math.max(t.getTime(), run.b.getTime(), this.dayStart.getTime()));
     const end = new Date(Math.min(run.e.getTime(), begin.getTime() + SPAN_MS));
     if (end - begin < 2000) { toast('That is the end of the recording.'); return; }
@@ -882,8 +1194,14 @@ const rec = {
   },
 
   onEnded() {
-    if (this.spanEnd && this.blockEnd && this.spanEnd < this.blockEnd) this.playAt(this.spanEnd);
-    else toast('End of recording.');
+    if (this.spanEnd && this.blockEnd && this.spanEnd < this.blockEnd) { this.playAt(this.spanEnd, true); return; }
+    // The end of a recorded stretch: carry on after the gap, if there is more today.
+    const next = this.blockEnd && this.blocks.find(b => b.b >= this.blockEnd);
+    if (next) {
+      const m = Math.round((next.b - this.blockEnd) / 60000);
+      toast(`Skipped a gap with no recording (${fmtClock(this.blockEnd)} to ${fmtClock(next.b)}${m ? `, ${m} min` : ''}).`);
+      this.playAt(next.b, true);
+    } else toast('End of recording.');
   },
 
   keepAlive() {
@@ -1010,9 +1328,44 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => { rec.stopSpan(); });
 
+// A window left open on a screen nobody is watching would stream all day. After
+// IDLE_MS without a mouse move, key or touch, stop the video and offer to resume.
+const IDLE_MS = 30 * 60 * 1000;
+let lastInput = Date.now(), idlePaused = null;
+['pointermove', 'pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(t =>
+  document.addEventListener(t, () => { lastInput = Date.now(); }, { passive: true, capture: true }));
+setInterval(() => {
+  if (idlePaused || document.hidden || Date.now() - lastInput < IDLE_MS) return;
+  const onLive = !$('#live').hidden;
+  if (onLive ? !live.active : !rec.sid) return;
+  idlePaused = onLive ? 'live' : 'rec';
+  if (onLive) live.stop(); else { $('#pb-video').pause(); rec.stopSpan(); }
+  $('#idle').hidden = false;
+  $('#idle-resume').focus();
+}, 15000);
+$('#idle-resume').addEventListener('click', () => {
+  $('#idle').hidden = true;
+  const what = idlePaused; idlePaused = null;
+  if (what === 'live') live.start();
+  else if (rec.cursor) rec.playAt(rec.cursor, true);
+});
+
+// Tell the viewer when the server can no longer sign in to Hik-Connect, instead of
+// leaving every camera to fail on its own.
+async function checkStatus() {
+  try {
+    const st = await api('/api/status');
+    const b = $('#login-banner');
+    b.hidden = st.login_ok;
+    if (!st.login_ok) $('#login-msg').textContent = st.error || 'Signing in failed.';
+  } catch { /* the server itself is unreachable: the tiles already say so */ }
+}
+setInterval(checkStatus, 60000);
+
 (async () => {
   $$('#layout button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.layout === live.layout)));
   $$('#profile button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.profile === live.profile)));
   await live.init();
+  checkStatus();
   showView(store.get('hik.view', 'live') === 'rec' ? 'rec' : 'live');
 })();

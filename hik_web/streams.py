@@ -206,20 +206,44 @@ def _put(q, item):
         q.put_nowait(None)
 
 
+AUDIO_TAG = b'AUD'      # a WebSocket message of live sound: tag, payload type, G.711 bytes.
+                        # (A video fragment starts with its 4-byte box size, which is never
+                        # this large, so the two cannot be confused.)
+
+
 class Fmp4Hub:
     """The fMP4 output of one session, shared by every WebSocket viewer.
 
     Each fragment starts with a keyframe, so a viewer that joins late gets the
-    init segment plus the latest fragment and shows a picture straight away."""
+    init segment plus the latest fragment and shows a picture straight away.
+    Viewers that turned the sound on also get the camera's audio packets."""
 
     def __init__(self):
         self.init = None
         self.mime = None
         self.last = None
         self.ended = False
+        self.has_audio = False
         self.ready = threading.Event()
         self._lock = threading.Lock()
         self._subs = set()                              # (loop, queue)
+        self._listeners = set()                         # (loop, queue) that want sound
+
+    def listen(self, loop, q, on):
+        with self._lock:
+            (self._listeners.add if on else self._listeners.discard)((loop, q))
+
+    def publish_audio(self, pt, data):
+        self.has_audio = True
+        with self._lock:
+            subs = list(self._listeners)
+        if subs:
+            msg = AUDIO_TAG + bytes([pt]) + data
+            for loop, q in subs:
+                try:
+                    loop.call_soon_threadsafe(_put, q, msg)
+                except RuntimeError:                    # loop already closed
+                    pass
 
     def subscribe(self, loop, q):
         with self._lock:
@@ -229,6 +253,7 @@ class Fmp4Hub:
     def unsubscribe(self, loop, q):
         with self._lock:
             self._subs.discard((loop, q))
+            self._listeners.discard((loop, q))
 
     def set_init(self, init):
         self.init, self.mime = init, _mime_from_init(init)
@@ -336,6 +361,8 @@ class SessionManager:
                 pass
             if mode == 'fmp4':
                 s.hub = Fmp4Hub()
+                if kind == 'live' and hasattr(s.stream, 'set_audio_sink'):
+                    s.stream.set_audio_sink(s.hub.publish_audio)
                 threading.Thread(target=self._pump_fmp4, args=(s,), daemon=True,
                                  name=f'hikweb-fmp4-{s.id}').start()
             threading.Thread(target=self._feed, args=(s,), daemon=True,

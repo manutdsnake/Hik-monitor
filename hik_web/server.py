@@ -12,18 +12,22 @@ import argparse
 import asyncio
 import base64
 import hmac
+import json
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
+import requests
 from aiohttp import web
 
 import hik_cloud
 from .account import Account
-from .streams import SessionManager
+from .bookmarks import Bookmarks
+from .streams import AUDIO_TAG, SessionManager
 
 log = logging.getLogger('hik_web')
 STATIC = os.path.join(os.path.dirname(__file__), 'static')
@@ -34,15 +38,65 @@ def _json_error(status, message, **extra):
     return web.json_response({'error': message, **extra}, status=status)
 
 
-def _stream_error(e):
+class CloudStatus:
+    """Whether the server can still sign in to Hik-Connect. The client signs in
+    again by itself when its session expires; this only goes bad when that
+    fails (password changed, the cloud asks for a CAPTCHA), and the page then
+    shows a banner instead of every camera failing on its own."""
+
+    RECHECK_SECONDS = 300           # a failed login is retried at most this often
+
+    def __init__(self):
+        self.error = None
+        self.since = None
+        self.checked = 0.0
+        self._lock = threading.Lock()
+
+    def failed(self, e):
+        with self._lock:
+            if self.error is None:
+                self.since = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+                log.warning('Hik-Connect sign-in failed: %s', e)
+            self.error, self.checked = str(e), time.monotonic()
+
+    def ok(self):
+        with self._lock:
+            if self.error is not None:
+                log.info('Hik-Connect sign-in works again')
+            self.error = self.since = None
+
+    def recheck(self, cloud):
+        """Try to sign in again, rarely: repeated failed logins can make the
+        cloud ask for a CAPTCHA."""
+        with self._lock:
+            if self.error is None or time.monotonic() - self.checked < self.RECHECK_SECONDS:
+                return
+            self.checked = time.monotonic()
+        try:
+            cloud.login()
+        except hik_cloud.AuthError as e:
+            self.failed(e)
+        except Exception:
+            pass                        # offline: not a sign-in problem
+        else:
+            self.ok()
+
+
+def _stream_error(e, status=None):
     """Map a cloud/stream exception to an HTTP response."""
     if isinstance(e, hik_cloud.EncryptedStreamError):
         return _json_error(409, str(e), needs_code=True, wrong=bool(e.wrong),
                            serial=e.serial, device=e.device_name)
     if isinstance(e, ValueError):
         return _json_error(400, str(e))
+    if isinstance(e, hik_cloud.AuthError):
+        if status is not None:
+            status.failed(e)
+        return _json_error(503, str(e), auth=True)
     if isinstance(e, hik_cloud.HikCloudError):
         return _json_error(502, str(e))
+    if isinstance(e, requests.RequestException):
+        return _json_error(502, 'Could not reach Hik-Connect. Check the server’s internet connection.')
     log.exception('unexpected error')
     return _json_error(500, f'{type(e).__name__}: {e}')
 
@@ -91,7 +145,7 @@ async def api_cameras(request):
     try:
         cams = await asyncio.to_thread(account.cameras, request.query.get('refresh') == '1')
     except Exception as e:
-        return _stream_error(e)
+        return _stream_error(e, request.app['status'])
     return web.json_response([
         {'key': c.key, 'name': c.name, 'device': c.device_name,
          'serial': c.device_serial, 'channel': c.channel_no,
@@ -106,7 +160,7 @@ async def api_snapshot(request):
     try:
         data = await asyncio.to_thread(account.snapshot, cam)
     except Exception as e:
-        return _stream_error(e)
+        return _stream_error(e, request.app['status'])
     return web.Response(body=data, content_type='image/jpeg',
                         headers={'Cache-Control': 'max-age=60'})
 
@@ -124,13 +178,14 @@ async def api_live(request):
         s = await asyncio.to_thread(mgr.live, account.cloud, cam,
                                     account.verify_code(cam.device_serial), quality,
                                     dar, mode)
+        request.app['status'].ok()
         if time.monotonic() - t0 > 3:
             log.info('slow live start for %s: shape %.1f s, open %.1f s', cam.name, t1 - t0,
                      time.monotonic() - t1)
     except Exception as e:
         if '6106' in str(e):                # the relay: no camera on this channel
             account.mark_empty(cam)
-        return _stream_error(e)
+        return _stream_error(e, request.app['status'])
     out = {'id': s.id, 'stream_type': s.info.get('stream_type')}
     out['ws' if mode == 'fmp4' else 'url'] = (
         f'/ws/live/{s.id}' if mode == 'fmp4' else f'/hls/{s.id}/index.m3u8')
@@ -149,7 +204,8 @@ async def api_records(request):
             account.cloud.search_records, cam, day,
             day + timedelta(hours=23, minutes=59, seconds=59))
     except Exception as e:
-        return _stream_error(e)
+        return _stream_error(e, request.app['status'])
+    request.app['status'].ok()
     return web.json_response({
         'now': datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
         'records': [{'begin': r['begin'], 'end': r['end'], 'type': r.get('type', '')}
@@ -173,7 +229,7 @@ async def api_playback(request):
                                     account.verify_code(cam.device_serial),
                                     begin, end, speed, dar, bool(body.get('fast')))
     except Exception as e:
-        return _stream_error(e)
+        return _stream_error(e, request.app['status'])
     return web.json_response({'id': s.id, 'url': f'/hls/{s.id}/index.m3u8'})
 
 
@@ -188,7 +244,7 @@ async def api_clip_start(request):
         job = await asyncio.to_thread(mgr.start_clip, account.cloud, cam,
                                       account.verify_code(cam.device_serial), begin, end)
     except Exception as e:
-        return _stream_error(e)
+        return _stream_error(e, request.app['status'])
     return web.json_response({'id': job.id, 'filename': job.filename})
 
 
@@ -239,10 +295,45 @@ async def api_session_close(request):
     return web.json_response({'ok': True})
 
 
+async def api_status(request):
+    status = request.app['status']
+    await asyncio.to_thread(status.recheck, request.app['account'].cloud)
+    return web.json_response({'login_ok': status.error is None, 'error': status.error,
+                              'since': status.since})
+
+
+# Bookmarks: moments in the recordings worth coming back to, kept on the server
+# so every browser sees the same list.
+async def api_bookmarks(request):
+    key = request.query.get('key') or None
+    return web.json_response(request.app['bookmarks'].list(key))
+
+
+async def api_bookmark_add(request):
+    body = await request.json()
+    cam = _camera_or_404(request, str(body.get('key', '')))
+    try:
+        when = _parse_time(body.get('time'))
+        note = str(body.get('note') or '').strip()[:200]
+    except ValueError as e:
+        return _json_error(400, str(e))
+    b = await asyncio.to_thread(request.app['bookmarks'].add, cam.key,
+                                when.strftime('%Y-%m-%dT%H:%M:%S'), note)
+    return web.json_response(b)
+
+
+async def api_bookmark_delete(request):
+    ok = await asyncio.to_thread(request.app['bookmarks'].delete, request.match_info['bid'])
+    return web.json_response({'ok': ok}, status=200 if ok else 404)
+
+
 async def ws_live(request):
     """Low-delay live video: the session's fMP4 fragments over a WebSocket.
     First a JSON message with the codec string, then the init segment, then
-    one binary message per fragment (each starts with a keyframe)."""
+    one binary message per fragment (each starts with a keyframe).
+
+    The viewer may send {"audio": true|false} to turn the camera's sound on or
+    off; sound then arrives as extra binary messages (see streams.AUDIO_TAG)."""
     s = request.app['sessions'].get(request.match_info['sid'])
     if s is None or s.hub is None:
         raise web.HTTPNotFound()
@@ -255,12 +346,18 @@ async def ws_live(request):
                             'detail': s.log_tail()})
         await ws.close()
         return ws
-    q = asyncio.Queue(maxsize=40)
+    q = asyncio.Queue(maxsize=200)          # ~1 s of video plus a few seconds of sound
     last = hub.subscribe(loop, q)
 
     async def watch_client():
-        async for _ in ws:                  # nothing is expected from the viewer
-            pass
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    want = json.loads(msg.data).get('audio')
+                except (ValueError, AttributeError):
+                    continue
+                if want is not None:
+                    hub.listen(loop, q, bool(want))
         _put_closed(q)
 
     def _put_closed(queue):
@@ -271,7 +368,7 @@ async def ws_live(request):
 
     watcher = asyncio.create_task(watch_client())
     try:
-        await ws.send_json({'mime': hub.mime})
+        await ws.send_json({'mime': hub.mime, 'audio': hub.has_audio})
         await ws.send_bytes(hub.init)
         if last:
             await ws.send_bytes(last)
@@ -279,7 +376,8 @@ async def ws_live(request):
             frag = await q.get()
             if frag is None or ws.closed:
                 break
-            s.touch()
+            if not frag.startswith(AUDIO_TAG):
+                s.touch()
             await ws.send_bytes(frag)
     except (ConnectionResetError, asyncio.CancelledError):
         pass
@@ -323,6 +421,8 @@ def make_app(account=None, password=None):
     app = web.Application(middlewares=[auth_middleware])
     app['account'] = account or Account()
     app['sessions'] = SessionManager()
+    app['status'] = CloudStatus()
+    app['bookmarks'] = Bookmarks(Bookmarks.default_path(app['account'].path))
     app['password'] = password if password is not None else os.environ.get('HIK_WEB_PASSWORD', '')
 
     def _warm_up():
@@ -343,6 +443,8 @@ def make_app(account=None, password=None):
                     pass                       # e.g. an empty channel
             with ThreadPoolExecutor(max_workers=6) as pool:
                 list(pool.map(prime, cams))
+        except hik_cloud.AuthError as e:
+            app['status'].failed(e)
         except Exception as e:
             log.warning('warm-up: %s', e)
         log.info('warm-up finished in %.1f s', time.monotonic() - t0)
@@ -370,6 +472,10 @@ def make_app(account=None, password=None):
     app.router.add_post('/api/verify-code', api_verify_code)
     app.router.add_post('/api/session/{sid}/touch', api_session_touch)
     app.router.add_delete('/api/session/{sid}', api_session_close)
+    app.router.add_get('/api/status', api_status)
+    app.router.add_get('/api/bookmarks', api_bookmarks)
+    app.router.add_post('/api/bookmarks', api_bookmark_add)
+    app.router.add_delete('/api/bookmarks/{bid}', api_bookmark_delete)
     app.router.add_get('/ws/live/{sid}', ws_live)
     app.router.add_get('/hls/{sid}/{name}', hls_file)
     return app
