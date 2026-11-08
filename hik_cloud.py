@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Iterator, Optional
 from urllib.parse import urlparse
 
+import logging
 import requests
 
 DEFAULT_API_BASE = 'https://api.hik-connect.com'
@@ -48,6 +49,9 @@ STREAM_SUB = 2
 
 
 # ── Errors ──────────────────────────────────────────────────────────────────
+log = logging.getLogger('hik_cloud')
+
+
 class HikCloudError(Exception):
     """Base error for the cloud client."""
 
@@ -195,8 +199,11 @@ class HikConnectCloud:
     def _request(self, method, path, *, params=None, data=None, retry=True):
         self.ensure_login()
         url = path if path.startswith('http') else f'{self.base_url}{path}'
+        t0 = time.monotonic()
         r = self._http.request(method, url, params=params, data=data,
                                headers=self._headers(), timeout=self.timeout)
+        if time.monotonic() - t0 > 2.0:
+            log.info('slow Hik-Connect call %s: %.1f s', path.split('?')[0], time.monotonic() - t0)
         if r.status_code == 401 and retry:
             self.login()
             return self._request(method, path, params=params, data=data, retry=False)
@@ -344,7 +351,7 @@ class HikConnectCloud:
                 seen.add(u); uniq.append(u)
         return uniq
 
-    def _resource_list(self, max_age=30.0):
+    def _resource_list(self, max_age=120.0):
         """The account's stream resources. One answer covers every camera, so
         opening several at once asks the cloud once instead of once each."""
         with self._lock:
