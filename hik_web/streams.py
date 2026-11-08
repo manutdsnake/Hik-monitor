@@ -299,6 +299,7 @@ class SessionManager:
               speed=1.0, max_height=None, dar=None, mode='hls'):
         s = Session(uuid.uuid4().hex[:12], kind, cam, self.root,
                     quality=quality, speed=speed, mode=mode)
+        t_start = time.monotonic()
         try:
             if kind == 'live':
                 s.stream = hik_cloud.open_live(cloud, cam, sub=(quality == 'sub'),
@@ -306,6 +307,7 @@ class SessionManager:
             else:
                 s.stream = hik_cloud.open_playback(cloud, cam, *playback,
                                                    verify_code=code)
+            t_relay = time.monotonic()
             s.info['stream_type'] = s.stream.stream_type
             small = bool(max_height and max_height <= 540)
             cmd = _ffmpeg_cmd(s.stream.input_format, s.dir, live=(kind == 'live'),
@@ -330,7 +332,8 @@ class SessionManager:
                              name=f'hikweb-feed-{s.id}').start()
             with self._lock:
                 self._sessions[s.id] = s
-            log.info('%s session %s: %s (%s, %s)', kind, s.id, cam.name, quality, mode)
+            log.info('%s session %s: %s (%s, %s) relay %.1f s, ready in %.1f s', kind, s.id, cam.name,
+                     quality, mode, t_relay - t_start, time.monotonic() - t_start)
             return s
         except BaseException:
             self._teardown(s)

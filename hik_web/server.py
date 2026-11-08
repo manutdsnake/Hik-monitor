@@ -118,10 +118,15 @@ async def api_live(request):
     quality = 'main' if body.get('quality') == 'main' else 'sub'
     mode = 'fmp4' if body.get('transport') == 'mse' else 'hls'
     try:
+        t0 = time.monotonic()
         dar = await asyncio.to_thread(account.aspect, cam)
+        t1 = time.monotonic()
         s = await asyncio.to_thread(mgr.live, account.cloud, cam,
                                     account.verify_code(cam.device_serial), quality,
                                     dar, mode)
+        if time.monotonic() - t0 > 3:
+            log.info('slow live start for %s: shape %.1f s, open %.1f s', cam.name, t1 - t0,
+                     time.monotonic() - t1)
     except Exception as e:
         if '6106' in str(e):                # the relay: no camera on this channel
             account.mark_empty(cam)
