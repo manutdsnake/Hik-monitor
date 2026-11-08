@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
@@ -67,6 +68,19 @@ class ApiError(HikCloudError):
 
 class StreamError(HikCloudError):
     """Cloud live stream could not be opened or delivered no usable video."""
+
+
+class EncryptedStreamError(StreamError):
+    """The device encrypts its video and we have no verification code, or the
+    one we have is wrong (``wrong``). ``serial`` / ``device_name`` identify the
+    device so the UI can ask for its code."""
+    needs_verify_code = True
+
+    def __init__(self, message, wrong=False):
+        super().__init__(message)
+        self.wrong = wrong
+        self.serial = ''
+        self.device_name = ''
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -403,17 +417,19 @@ def _cloud_time(t):
     return t.strftime('%Y%m%dT%H%M%SZ')
 
 
+def _key16(code):
+    """Verification code → 16-byte AES key (zero-padded / truncated)."""
+    b = (code or '').encode()
+    return b[:16] if len(b) >= 16 else b + b'\0' * (16 - len(b))
+
+
 def _decrypt_capture(raw, validate_code):
     from Crypto.Cipher import AES
     from Crypto.Util.Padding import unpad
 
-    def key16(v):
-        b = (v or '').encode()
-        return b[:16] if len(b) >= 16 else b + b'\0' * (16 - len(b))
-
     if len(raw) <= 48:
         raise HikCloudError('Encrypted snapshot too small')
-    dec = AES.new(key16(validate_code), AES.MODE_CBC, key16('01234567')).decrypt(raw[48:])
+    dec = AES.new(_key16(validate_code), AES.MODE_CBC, _key16('01234567')).decrypt(raw[48:])
     try:
         dec = unpad(dec, AES.block_size)
     except ValueError:
@@ -421,6 +437,46 @@ def _decrypt_capture(raw, validate_code):
     if not dec.startswith(_JPEG_MAGIC):
         raise HikCloudError('Snapshot decrypt failed — wrong verify code?')
     return dec
+
+
+# ── Video encryption (device "stream encryption" / verification code) ───────
+# A device with video encryption on still sends normal RTP / MPEG-PS framing,
+# but for the *flagged* frames the first 4096 bytes of every video NAL (after
+# the codec's NAL header; parameter sets included) are AES-128-ECB encrypted,
+# key = verification code zero-padded to 16 bytes. Which frames are flagged
+# (an NVR we tested: every keyframe and ~1 in 4 of the rest):
+#   RTP      the frame's packets carry an RTP header extension
+#   MPEG-PS  PES_scrambling_control != 0 on the frame's video PES packets
+# The cipher layout matches pyezvizapi.stream.decrypt_hikvision_ps_video.
+_ENC_PREFIX = 4096
+_H264_PROFILES = {44, 66, 77, 83, 86, 88, 100, 110, 118, 122, 128, 134, 135,
+                  138, 139, 244}
+
+
+def _decrypt_nal_bytes(nal, key, hdr):
+    """Decrypt the encrypted prefix of one NAL (no start code); the first
+    ``hdr`` bytes (the NAL header) are not encrypted."""
+    from Crypto.Cipher import AES
+    n = min(len(nal) - hdr, _ENC_PREFIX)
+    n -= n % 16
+    if n <= 0:
+        return bytes(nal)
+    body = AES.new(key, AES.MODE_ECB).decrypt(bytes(nal[hdr:hdr + n]))
+    return bytes(nal[:hdr]) + body + bytes(nal[hdr + n:])
+
+
+def _judge_param_set(nal, codec=None):
+    """For a HEVC VPS / H.264 SPS (no start code) return ``(codec, looks_clear)``
+    — ``looks_clear`` is False for scrambled bytes, which is how we tell an
+    encrypted stream (and a wrong code) from a clear one. None for any other
+    NAL type, which cannot be judged."""
+    if codec in (None, 'hevc') and len(nal) >= 6 and nal[0] & 0x81 == 0 \
+            and (nal[0] >> 1) & 0x3F == 32 and nal[1] & 7:
+        return 'hevc', nal[4:6] == b'\xff\xff'        # vps_reserved_0xffff_16bits
+    if codec in (None, 'h264') and len(nal) >= 4 and nal[0] & 0x80 == 0 \
+            and nal[0] & 0x1F == 7:
+        return 'h264', nal[1] in _H264_PROFILES and nal[2] & 0x03 == 0
+    return None
 
 
 # ── RTP video depacketizer (H.264 + H.265) ─────────────────────────────────
@@ -431,14 +487,18 @@ def _decrypt_capture(raw, validate_code):
 class _RtpVideoDepacketizer:
     _PS = {'h264': (7, 8), 'hevc': (32, 33, 34)}
 
-    def __init__(self):
+    def __init__(self, key=None):
         self.codec = None        # 'h264' | 'hevc' once detected
         self.pt = None
         self.saw_slice = False
+        self.key = key           # 16-byte AES key (device verification code) or None
+        self.encrypted = None    # None = not judged yet, else is this stream scrambled?
         self._frag = None
         self._seq = None
         self._ps = {}
         self._just_sent_ps = False
+        self._ts = None          # RTP timestamp of the current frame
+        self._frame_flagged = False
 
     # NAL type of an Annex-B unit (start code included)
     def _type(self, nal):
@@ -465,6 +525,10 @@ class _RtpVideoDepacketizer:
         if not p:
             return []
         if self.pt is None:
+            # Never detect video on static (G.711 audio…) or Hik-private (112)
+            # payload types: their first byte can look like an SPS by chance.
+            if pt < 96 or pt == 112:
+                return []
             codec = self._detect(p)
             if codec is None:
                 return []
@@ -474,8 +538,37 @@ class _RtpVideoDepacketizer:
         if self._seq is not None and seq != (self._seq + 1) & 0xFFFF:
             self._frag = None            # lost a packet → drop partial NAL
         self._seq = seq
+        ts = bytes(pkt[4:8])
+        if ts != self._ts:                       # new frame
+            self._ts, self._frame_flagged = ts, False
+        if pkt[0] & 0x10:                        # RTP header extension → flagged frame
+            self._frame_flagged = True
         nals = self._depay_hevc(p) if self.codec == 'hevc' else self._depay_h264(p)
+        if self._frame_flagged and self.encrypted is not False:
+            nals = list(map(self._decrypt, nals))
         return [o for o in map(self._inject, nals) if o]
+
+    def _decrypt(self, nal):
+        """Decrypt one NAL (start code included) of a flagged frame. The first
+        parameter set decides whether the stream really is scrambled and
+        whether our code is right; NALs that cannot be judged pass through."""
+        hdr = 2 if self.codec == 'hevc' else 1
+        raw = nal[4:]
+        if self.encrypted is None:
+            j = _judge_param_set(raw, self.codec)
+            if j is None:
+                return nal
+            if j[1]:                             # clear → the flag meant something else
+                self.encrypted = False
+                return nal
+            if not self.key:
+                raise EncryptedStreamError(
+                    'Video encryption is on — verification code needed')
+            j = _judge_param_set(_decrypt_nal_bytes(raw, self.key, hdr), self.codec)
+            if not (j and j[1]):
+                raise EncryptedStreamError('Wrong verification code', wrong=True)
+            self.encrypted = True
+        return _START_CODE + _decrypt_nal_bytes(raw, self.key, hdr)
 
     def _depay_h264(self, p):
         t = p[0] & 0x1F
@@ -558,6 +651,117 @@ class _RtpVideoDepacketizer:
         return prefix + nal
 
 
+# ── MPEG-PS decryptor (recordings replayed from the NVR) ─────────────────────
+_PS_BOUNDARY = re.compile(b'\x00\x00\x01[\xb9-\xff]')   # a PS start code, never a NAL
+
+
+class _PsDecryptor:
+    """Streaming decryptor for the MPEG-PS the NVR replays recordings as. Video
+    PES packets whose PES_scrambling_control is set hold encrypted NALs; those
+    are collected into runs (a NAL may span adjacent PES packets) and decrypted
+    with pyezvizapi's routine. Everything else passes through untouched."""
+
+    def __init__(self, key=None):
+        self.key = key
+        self.encrypted = None            # None = not judged yet
+        self.codec = None
+        self._buf = bytearray()
+        self._run = bytearray()          # trailing flagged video PES run
+        self._saw_clear = False          # a video PES without the scrambling flag went by
+
+    @property
+    def ready(self):
+        """True once we know whether this stream is scrambled (so a missing or
+        wrong code has already been reported)."""
+        return self.encrypted is not None or self._saw_clear
+
+    @staticmethod
+    def _packet_end(buf, pos):
+        """End offset of the PS packet at ``pos``; None = incomplete."""
+        if len(buf) - pos < 4:
+            return None
+        if buf[pos:pos + 3] != b'\x00\x00\x01':      # resync to the next start code
+            nxt = buf.find(b'\x00\x00\x01', pos + 1)
+            if nxt >= 0:
+                return nxt
+            return len(buf) - 2 if len(buf) - pos > 2 else None
+        sid = buf[pos + 3]
+        if sid == 0xBA:                                 # pack header
+            if len(buf) - pos < 14:
+                return None
+            end = pos + 14 + (buf[pos + 13] & 7) if buf[pos + 4] & 0xC0 == 0x40 \
+                else pos + 12                           # MPEG-2 : MPEG-1
+            return end if end <= len(buf) else None
+        if sid == 0xB9:
+            return pos + 4
+        if len(buf) - pos < 6:
+            return None
+        ln = int.from_bytes(buf[pos + 4:pos + 6], 'big')
+        if ln:
+            end = pos + 6 + ln
+            return end if end <= len(buf) else None
+        m = _PS_BOUNDARY.search(buf, pos + 6)           # unbounded video PES
+        return m.start() if m else None
+
+    def feed(self, data):
+        buf = self._buf
+        buf += data
+        out = bytearray()
+        pos = 0
+        while True:
+            end = self._packet_end(buf, pos)
+            if end is None:
+                break
+            pkt = bytes(buf[pos:end])
+            pos = end
+            sid = pkt[3] if len(pkt) > 3 else 0
+            video = 0xE0 <= sid <= 0xEF and len(pkt) >= 9
+            if video and (pkt[6] >> 4) & 3 and self.encrypted is not False:
+                self._run += pkt                        # wait for the end of the run
+                continue
+            if video and not (pkt[6] >> 4) & 3:
+                self._saw_clear = True
+            if self._run:
+                out += self._flush_run()
+            out += pkt
+        del buf[:pos]
+        return bytes(out)
+
+    @staticmethod
+    def _first_nal(run):
+        """First NAL (after its start code) of the run's first PES payload."""
+        start = 9 + run[8]
+        i = run.find(b'\x00\x00\x01', start, start + 8)
+        return bytes(run[i + 3:i + 3 + 64]) if i >= 0 else b''
+
+    def _decrypt_run(self, run):
+        from pyezvizapi.stream import decrypt_hikvision_ps_video
+        return decrypt_hikvision_ps_video(
+            run, self.key, nalu_header_size=2 if self.codec == 'hevc' else 1)
+
+    def _flush_run(self):
+        run = bytes(self._run)
+        self._run.clear()
+        if self.encrypted is None:
+            j = _judge_param_set(self._first_nal(run))
+            if j is None:
+                return run                              # cannot judge → pass through
+            self.codec = j[0]
+            if j[1]:
+                self.encrypted = False
+                return run
+            if not self.key:
+                raise EncryptedStreamError(
+                    'Video encryption is on — verification code needed')
+            dec = self._decrypt_run(run)
+            j = _judge_param_set(self._first_nal(dec), self.codec)
+            if not (j and j[1]):
+                raise EncryptedStreamError('Wrong verification code', wrong=True)
+            self.encrypted = True
+            return dec
+        return self._decrypt_run(run)
+
+
 # ── Live session ────────────────────────────────────────────────────────────
 class CloudLiveStream:
     """One VTM live session. Usage::
@@ -570,7 +774,8 @@ class CloudLiveStream:
     """
 
     def __init__(self, cloud: HikConnectCloud, cam: CloudCamera,
-                 stream_type=STREAM_SUB, timeout=15.0, playback=None):
+                 stream_type=STREAM_SUB, timeout=15.0, playback=None,
+                 verify_code=None):
         self.cloud = cloud
         self.cam = cam
         self.stream_type = stream_type
@@ -582,6 +787,8 @@ class CloudLiveStream:
         self._pending = []
         self._closed = False
         self._depay = None
+        self._ps = None
+        self._key = _key16(verify_code) if verify_code else None
 
     def start(self, probe_seconds=6.0):
         from pyezvizapi.stream import VtmStreamClient
@@ -609,14 +816,20 @@ class CloudLiveStream:
                 if time.monotonic() > deadline:
                     break
             raise StreamError('Cloud stream sent no decodable video')
-        except Exception:
+        except Exception as e:
+            if isinstance(e, EncryptedStreamError):
+                e.serial, e.device_name = self.cam.device_serial, self.cam.device_name
             self.close()
             raise
 
     @property
     def _has_video(self):
         d = self._depay
-        return d is None or d.saw_slice
+        if d is not None:
+            return d.saw_slice
+        # MPEG-PS: ready once we know whether it is scrambled, so a missing or
+        # wrong verification code is raised here, not later in the feed thread.
+        return self._ps is None or self._ps.ready
 
     def _media_chunks(self):
         from pyezvizapi.stream import StreamTransport, VtmChannel, detect_transport
@@ -628,16 +841,18 @@ class CloudLiveStream:
                     or not pkt.body:
                 continue
             if pkt.encrypted:
-                raise StreamError('Stream is encrypted (video encryption on the '
-                                  'device) — not supported yet')
+                raise StreamError('Stream uses end-to-end (ECDH) encryption — '
+                                  'not supported')
             t = detect_transport(pkt.body)
             if transport == StreamTransport.UNKNOWN and t != StreamTransport.UNKNOWN:
                 transport = t
                 if t == StreamTransport.RTP:
-                    self._depay = _RtpVideoDepacketizer()
+                    self._depay = _RtpVideoDepacketizer(self._key)
                 else:
                     self.input_format = {StreamTransport.MPEG_PS: 'mpeg',
                                          StreamTransport.MPEG_TS: 'mpegts'}.get(t)
+                    if t == StreamTransport.MPEG_PS:
+                        self._ps = _PsDecryptor(self._key)
             # Lock onto the first detected transport: MPEG-PS continuation
             # packets can start with a byte that merely looks like RTP v2.
             active = transport
@@ -646,7 +861,9 @@ class CloudLiveStream:
                 if self.input_format is None and self._depay.codec:
                     self.input_format = self._depay.codec
                 yield out              # b'' lets start() check its deadline
-            elif active in (StreamTransport.MPEG_PS, StreamTransport.MPEG_TS):
+            elif active == StreamTransport.MPEG_PS:
+                yield self._ps.feed(pkt.body)   # b'' while a frame is held back
+            elif active == StreamTransport.MPEG_TS:
                 yield pkt.body
             else:
                 yield b''
@@ -670,17 +887,18 @@ class CloudLiveStream:
 
 
 def open_live(cloud: HikConnectCloud, cam: CloudCamera, sub=True,
-              timeout=15.0) -> CloudLiveStream:
+              timeout=15.0, verify_code=None) -> CloudLiveStream:
     """Open a live stream, preferring the requested profile and falling back
     to the other one (some NVR channels send undecodable data on main, some
     cameras have no substream)."""
     order = [STREAM_SUB, STREAM_MAIN] if sub else [STREAM_MAIN, STREAM_SUB]
     last = None
     for st in order:
-        s = CloudLiveStream(cloud, cam, st, timeout=timeout)
+        s = CloudLiveStream(cloud, cam, st, timeout=timeout,
+                            verify_code=verify_code)
         try:
             return s.start()
-        except AuthError:
+        except (AuthError, EncryptedStreamError):
             raise
         except Exception as e:
             last = e
@@ -688,15 +906,16 @@ def open_live(cloud: HikConnectCloud, cam: CloudCamera, sub=True,
 
 
 def open_playback(cloud: HikConnectCloud, cam: CloudCamera, start, end,
-                  timeout=15.0) -> CloudLiveStream:
+                  timeout=15.0, verify_code=None) -> CloudLiveStream:
     """Replay a device recording (start/end = device local datetimes).
     Main profile first (that is what NVRs record), sub as fallback."""
     last = None
     for st in (STREAM_MAIN, STREAM_SUB):
-        s = CloudLiveStream(cloud, cam, st, timeout=timeout, playback=(start, end))
+        s = CloudLiveStream(cloud, cam, st, timeout=timeout, playback=(start, end),
+                            verify_code=verify_code)
         try:
             return s.start()
-        except AuthError:
+        except (AuthError, EncryptedStreamError):
             raise
         except Exception as e:
             last = e

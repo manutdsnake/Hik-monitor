@@ -215,7 +215,7 @@ from PyQt5.QtWidgets import (
     QDateEdit, QListWidget, QListWidgetItem, QSplitter, QFrame,
     QGroupBox, QScrollArea, QSizePolicy, QProgressBar, QStatusBar,
     QTabWidget, QMessageBox, QToolBar, QAction, QSlider, QStyle,
-    QTreeWidget, QTreeWidgetItem, QDialog
+    QTreeWidget, QTreeWidgetItem, QDialog, QInputDialog
 )
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QDate, QSize, QMutex, QMutexLocker,
@@ -374,6 +374,7 @@ class NVRClient:
                         c.password_md5 = d.get('password_md5', '')
                         c.api_base = d.get('api_base') or None
                         c.client_version = d.get('client_version') or None
+                        c.verify_codes = dict(d.get('verify_codes') or {})
                     else:
                         c = cls(d.get('id'), d.get('name', 'NVR'))
                         c.username = d.get('username', 'admin')
@@ -944,6 +945,8 @@ class HikConnectClient:
         self.password_md5 = ''
         self.api_base  = None        # regional API host, learned at login
         self.client_version = None
+        # device serial → verification code (only for devices with video encryption on)
+        self.verify_codes = {}
         self.host      = 'Hik-Connect cloud'   # display + "is configured" flag
         self.port      = 443
         self.username  = ''
@@ -964,6 +967,12 @@ class HikConnectClient:
                     self.account, self.password_md5, api_base=self.api_base,
                     client_version=self.client_version)
             return self._cloud
+
+    def verify_code(self, serial):
+        return self.verify_codes.get(serial) or None
+
+    def set_verify_code(self, serial, code):
+        self.verify_codes[serial] = code
 
     def test(self):
         try:
@@ -996,7 +1005,8 @@ class HikConnectClient:
 
     def snapshot(self, channel_id):
         cam = self.camera(channel_id)
-        return self.cloud().snapshot(cam) if cam else None
+        return (self.cloud().snapshot(cam, self.verify_code(cam.device_serial))
+                if cam else None)
 
     def playback_source(self, channel_id, start_dt, end_dt):
         """VideoWorker cloud_source replaying the device's own recording."""
@@ -1033,10 +1043,25 @@ class HikConnectClient:
             d['api_base'] = self.api_base
         if self.client_version:
             d['client_version'] = self.client_version
+        if self.verify_codes:
+            d['verify_codes'] = self.verify_codes
         return d
 
 
 # ── Video Worker Thread ────────────────────────────────────────────────────────
+# Error message a worker emits when the device encrypts its video and needs
+# (or rejected) a verification code: 'NEED_VERIFY_CODE|serial|wrong(0/1)|name'.
+_NEED_CODE = 'NEED_VERIFY_CODE'
+
+
+def _parse_need_code(msg):
+    """(serial, wrong, device_name) for a NEED_VERIFY_CODE error, else None."""
+    if not msg.startswith(_NEED_CODE + '|'):
+        return None
+    _, serial, wrong, name = (msg.split('|', 3) + ['', '', ''])[:4]
+    return serial, wrong == '1', name
+
+
 def _sniff_codec(data: bytes):
     """
     Detect H.264 vs H.265 from a raw elementary stream by inspecting NAL headers.
@@ -1286,11 +1311,13 @@ class VideoWorker(QThread):
         if cam is None:
             raise RuntimeError('camera not found on the Hik-Connect account')
         playback = src.get('playback')
+        code = src['client'].verify_code(cam.device_serial)
         if playback:
-            stream = hik_cloud.open_playback(src['client'].cloud(), cam, *playback)
+            stream = hik_cloud.open_playback(src['client'].cloud(), cam, *playback,
+                                             verify_code=code)
         else:
             stream = hik_cloud.open_live(src['client'].cloud(), cam,
-                                         sub=src.get('sub', False))
+                                         sub=src.get('sub', False), verify_code=code)
         if self._stop.is_set():
             stream.close()
             raise RuntimeError('stopped')
@@ -1307,7 +1334,10 @@ class VideoWorker(QThread):
             extra_in = ['-readrate', f'{self.speed or 1.0:g}', '-f', stream.input_format,
                         '-probesize', '500000', '-analyzeduration', '1000000']
         else:
-            extra_in = ['-f', stream.input_format, '-fflags', 'nobuffer',
+            # No '-fflags nobuffer': it makes ffmpeg drop the first keyframe, so
+            # the picture stays flat grey until the next one (~2 s) — measured
+            # on live H.265 streams. Start-up latency is the same without it.
+            extra_in = ['-f', stream.input_format,
                         '-probesize', '2048', '-analyzeduration', '0']
         cmd = self._ffmpeg_base(extra_in, 'pipe:0')
         # stderr → DEVNULL: lossy cloud links make the decoder chatty, and an
@@ -1907,7 +1937,11 @@ class VideoWorker(QThread):
             self.error.emit(self.channel_id, 'ffmpeg not found — please install ffmpeg')
             return
         except Exception as e:
-            self.error.emit(self.channel_id, f'Cannot open stream: {e}')
+            if getattr(e, 'needs_verify_code', False):     # hik_cloud.EncryptedStreamError
+                self.error.emit(self.channel_id, f'{_NEED_CODE}|{e.serial}|'
+                                                 f'{int(e.wrong)}|{e.device_name}')
+            else:
+                self.error.emit(self.channel_id, f'Cannot open stream: {e}')
             return
 
         stdout = self._proc.stdout
@@ -2207,7 +2241,9 @@ class FullscreenWindow(QWidget):
             self.worker = VideoWorker(f'fs_{channel_id}', nvr.rtsp_live_url(real_ch),
                                       decode_w=1280, decode_h=720)
         self.worker.frame_ready.connect(self._on_frame, Qt.QueuedConnection)
-        self.worker.error.connect(lambda _, m: self.label.setText(f'⚠ {m}'))
+        self.worker.error.connect(lambda _, m: self.label.setText(
+            '🔒 Encrypted — enter the verification code in the main window'
+            if _parse_need_code(m) else f'⚠ {m}'))
         self.worker.start()
 
     def _on_frame(self, _, qi):
@@ -2382,6 +2418,7 @@ class VideoCell(QFrame):
         self.placeholder.show()
 
         self._streaming = True
+        self._needs_code = False
         self._sub = sub              # current quality (layout switch skips no-op restarts)
         self.status_dot.setStyleSheet(f'color: {DARK["amber"]}; font-size: 10px; border: none;')
         self.placeholder.setText(f'⏳\nConnecting...')
@@ -2481,6 +2518,23 @@ class VideoCell(QFrame):
             dlog('Cell', f'{self.name} no sub-stream, falling back to main')
             self._streaming = False
             QTimer.singleShot(100, lambda: self.start_stream(sub=False))
+            return
+        req = _parse_need_code(msg)
+        if req:
+            # Device has video encryption on: ask for its verification code once
+            # (all cells of that device share the prompt), then restart them.
+            serial, wrong, device_name = req
+            self._streaming = False
+            self._needs_code = True
+            self.video_label.hide()
+            self.placeholder.setText('🔒\nWrong verification code' if wrong
+                                     else '🔒\nEncrypted — verification code needed')
+            self.placeholder.show()
+            self.status_dot.setStyleSheet(f'color: {DARK["amber"]}; font-size: 10px; border: none;')
+            win = self.window()
+            if hasattr(win, 'ask_verify_code'):
+                QTimer.singleShot(0, lambda: win.ask_verify_code(
+                    self.nvr, serial, device_name, wrong))
             return
         self._streaming = False
         self.video_label.hide()
@@ -3779,6 +3833,19 @@ class PlaybackTab(QWidget):
     def _on_pb_error(self, _, msg):
         self.timer.stop()
         self.btn_pause.setEnabled(False)
+        req = _parse_need_code(msg)
+        if req:
+            serial, wrong, device_name = req
+            self.video_label.setText('🔒 Wrong verification code' if wrong
+                                     else '🔒 Encrypted — verification code needed')
+            row = getattr(self, '_current_rec_idx', self.rec_list.currentRow())
+            win = self.window()
+            if hasattr(win, 'ask_verify_code'):
+                nvr = self._get_nvr_for_cam(self.cam_combo.currentData())
+                QTimer.singleShot(0, lambda: (
+                    win.ask_verify_code(nvr, serial, device_name, wrong)
+                    and self._play_recording(row)))
+            return
         # When a recording finishes normally, auto-advance to the next one in the
         # list (continuous playback). Other errors just show the message.
         if msg == 'Playback finished':
@@ -4552,6 +4619,7 @@ class MainWindow(QMainWindow):
 
         self._all_cameras = []   # [{id, name, nvr_name, nvr_id, _nvr}]
         self._nvr_map     = {}   # cam_id -> NVRClient
+        self._code_prompts = set()   # device serials with a code dialog open
 
         # ── UI ─────────────────────────────────────────────────
         central = QWidget()
@@ -5087,11 +5155,38 @@ class MainWindow(QMainWindow):
             self.audio.stop()
             self.status.showMessage('Audio stopped')
 
+    def ask_verify_code(self, nvr, serial, device_name='', wrong=False):
+        """Ask for the verification code of a device with video encryption on
+        (printed on the device label, or the one set in the Hik-Connect app),
+        remember it and restart that device's streams. Several cells of one
+        device fail together — only one dialog is shown. True if a code was saved."""
+        if nvr is None or serial in self._code_prompts:
+            return False
+        self._code_prompts.add(serial)
+        try:
+            label = f'{device_name} ({serial})' if device_name else serial
+            note = ('The code was not accepted — try again.\n\n' if wrong else '')
+            text, ok = QInputDialog.getText(
+                self, 'Video encryption',
+                f'{note}{label} has video encryption turned on.\n'
+                'Enter its verification code (on the device label, or the one you '
+                'set in the Hik-Connect app):', QLineEdit.Password)
+        finally:
+            self._code_prompts.discard(serial)
+        code = text.strip()
+        if not ok or not code:
+            return False
+        nvr.set_verify_code(serial, code)
+        NVRClient.save_all(self.devices)
+        self._restart_nvr_streams(nvr)
+        return True
+
     def _restart_nvr_streams(self, nvr):
         """Restart any live cells belonging to this device (e.g. after a quality
         change) so the new stream URL takes effect."""
         for uid, cell in list(self.live_tab.cells.items()):
-            if self._nvr_map.get(uid) is nvr and getattr(cell, '_streaming', False):
+            if self._nvr_map.get(uid) is nvr and (
+                    getattr(cell, '_streaming', False) or getattr(cell, '_needs_code', False)):
                 cell.stop_stream()
                 QTimer.singleShot(300, lambda c=cell: c.start_stream(
                     self.live_tab._should_use_sub()))
