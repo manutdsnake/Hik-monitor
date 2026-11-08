@@ -126,6 +126,8 @@ class HikConnectCloud:
         self.refresh_session_id = None
         self._feature_code = secrets.token_hex(16)
         self._service_urls = None
+        self._resources = None
+        self._tokens, self._tokens_at = [], 0.0
         self._http = requests.Session()
         self._lock = threading.RLock()
 
@@ -185,6 +187,8 @@ class HikConnectCloud:
             if not self.session_id:
                 raise AuthError('Login succeeded but no sessionId was returned')
             self._service_urls = None
+            self._resources = None
+            self._tokens = []
 
     def ensure_login(self):
         if not self.session_id:
@@ -293,6 +297,17 @@ class HikConnectCloud:
             raise AuthError('sessionId has no VTDU sign claim')
         return sign
 
+    def _next_token(self, max_age=45.0):
+        """One VTDU stream token. They come several per request, so a pool
+        saves a cloud call per camera when many are opened together."""
+        with self._lock:
+            if self._tokens and time.monotonic() - self._tokens_at < max_age:
+                return self._tokens.pop()
+        toks = self._vtdu_tokens(count=10)
+        with self._lock:
+            self._tokens, self._tokens_at = toks[1:], time.monotonic()
+        return toks[0]
+
     def _vtdu_tokens(self, count=5):
         self.ensure_login()
         last = None
@@ -342,13 +357,25 @@ class HikConnectCloud:
                 seen.add(u); uniq.append(u)
         return uniq
 
+    def _resource_list(self, max_age=30.0):
+        """The account's stream resources. One answer covers every camera, so
+        opening several at once asks the cloud once instead of once each."""
+        with self._lock:
+            hit = self._resources
+            if hit and time.monotonic() - hit[0] < max_age:
+                return hit[1]
+        pl = self.request_json('GET', '/v3/userdevices/v1/resources/pagelist',
+                               params={'groupId': -1, 'limit': 50, 'offset': 0,
+                                       'filter': 'VTM'})
+        with self._lock:
+            self._resources = (time.monotonic(), pl)
+        return pl
+
     def live_url(self, cam: CloudCamera, stream_type=STREAM_SUB):
         """Build the ysproto:// VTM URL for one camera channel."""
         from pyezvizapi.stream import build_vtm_url
 
-        pl = self.request_json('GET', '/v3/userdevices/v1/resources/pagelist',
-                               params={'groupId': -1, 'limit': 50, 'offset': 0,
-                                       'filter': 'VTM'})
+        pl = self._resource_list()
         resources = pl.get('resourceInfos') or []
         vtms = pl.get('VTM') or {}
         res = next((r for r in resources if isinstance(r, dict)
@@ -368,7 +395,7 @@ class HikConnectCloud:
         port = vtm.get('port')
         if not host or not str(port or '').isdigit():
             raise StreamError('No VTM relay endpoint for this camera')
-        token = self._vtdu_tokens()[0]
+        token = self._next_token()
         url = build_vtm_url(str(host).strip(), int(port), cam.device_serial,
                             str(res.get('streamBizUrl') or ''), token,
                             channel=cam.channel_no, client_type=int(CLIENT_TYPE))
@@ -832,6 +859,17 @@ class CloudLiveStream:
         return self._ps is None or self._ps.ready
 
     def _media_chunks(self):
+        from pyezvizapi.exceptions import PyEzvizError
+        try:
+            yield from self._media_chunks_inner()
+        except PyEzvizError as e:
+            # At the end of a recording the relay sends a control packet on
+            # channel 0x02, which pyezvizapi cannot decode. That is the normal
+            # end of the stream, not a failure.
+            if not (self.playback and 'Unknown VTM channel: 0x02' in str(e)):
+                raise
+
+    def _media_chunks_inner(self):
         from pyezvizapi.stream import StreamTransport, VtmChannel, detect_transport
         transport = StreamTransport.UNKNOWN
         for pkt in self._vtm.iter_packets():
