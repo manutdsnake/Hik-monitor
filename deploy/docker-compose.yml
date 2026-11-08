@@ -27,8 +27,8 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    cpus: 2                           # live video is transcoded: keep it from starving the host
-    cpu_shares: 512                   # and give way to other containers when the host is busy
+    cpus: 3                           # six live tiles at night need ~2 cores: a lower cap makes the video stall
+    cpu_shares: 512                   # but give way to other containers when the host is busy
     mem_limit: 1g
     pids_limit: 256
     healthcheck:

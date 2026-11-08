@@ -93,18 +93,27 @@ class ClipJob:
 
 
 def _ffmpeg_cmd(fmt, outdir, *, live, speed=1.0, max_height=None, dar=None,
-                mode='hls', crf=24, maxrate=None, bufsize=None, threads=None):
+                mode='hls', crf=24, maxrate=None, bufsize=None, threads=None, fps=None):
     """ffmpeg: raw/PS cloud stream on stdin → H.264 for the browser.
 
     mode 'hls':  fMP4 HLS files in ``outdir`` (1 s segments).
     mode 'fmp4': fragmented MP4 on stdout, a fragment per second (starting with
                  a keyframe), for the WebSocket player.
+    fps:         the camera's real frame rate for a raw live stream. Raw video
+                 has no timing and ffmpeg assumes 25 fps, so a 12.5 fps camera
+                 would play at double speed and stall between fragments.
     """
     cmd = [FFMPEG, '-hide_banner', '-loglevel', 'warning', '-nostdin']
+    gop = 25
     if live:
         # Raw elementary stream: the format is known and the first chunk holds
-        # the parameter sets, so a tiny probe is enough (cameras send 25 fps).
+        # the parameter sets, so a tiny probe is enough.
         cmd += ['-f', fmt, '-probesize', '2048', '-analyzeduration', '0']
+        if fps and fmt in ('h264', 'hevc'):
+            # (-r, not -framerate: the demuxer takes its timing from the stream's
+            # own VUI data, which these cameras set to 25 whatever they send.)
+            cmd += ['-r', f'{fps:g}']
+            gop = max(gop, round(fps))
     else:
         # Recordings arrive as MPEG-PS, faster than real time → pace them.
         cmd += ['-readrate', f'{speed:g}', '-f', fmt,
@@ -133,7 +142,7 @@ def _ffmpeg_cmd(fmt, outdir, *, live, speed=1.0, max_height=None, dar=None,
         cmd += ['-threads', str(threads)]
     if maxrate:
         cmd += ['-maxrate', maxrate, '-bufsize', bufsize or maxrate]
-    cmd += ['-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
+    cmd += ['-g', str(gop), '-keyint_min', str(gop), '-sc_threshold', '0',
             '-force_key_frames', 'expr:gte(t,n_forced*1)']
     if mode == 'fmp4':
         return cmd + ['-flush_packets', '1', '-f', 'mp4',
@@ -315,7 +324,8 @@ class SessionManager:
                               crf=24 if small else 25,
                               maxrate='3000k' if small else '8000k',
                               bufsize='6000k' if small else '16000k',
-                              threads=1 if small else 2)
+                              threads=1 if small else 2,
+                              fps=getattr(s.stream, 'fps', None) if kind == 'live' else None)
             with open(os.path.join(s.dir, 'ffmpeg.log'), 'wb') as logf:
                 s.proc = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, cwd=s.dir, stderr=logf,
@@ -332,8 +342,10 @@ class SessionManager:
                              name=f'hikweb-feed-{s.id}').start()
             with self._lock:
                 self._sessions[s.id] = s
-            log.info('%s session %s: %s (%s, %s) relay %.1f s, ready in %.1f s', kind, s.id, cam.name,
-                     quality, mode, t_relay - t_start, time.monotonic() - t_start)
+            fps = getattr(s.stream, 'fps', None)
+            log.info('%s session %s: %s (%s, %s%s) relay %.1f s, ready in %.1f s', kind, s.id, cam.name,
+                     quality, mode, f', {fps:g} fps' if fps and kind == 'live' else '',
+                     t_relay - t_start, time.monotonic() - t_start)
             return s
         except BaseException:
             self._teardown(s)

@@ -46,6 +46,7 @@ _AUTH_EXPIRED_CODES = {401, 1003, 1004, 1005, 1006}
 
 STREAM_MAIN = 1
 STREAM_SUB = 2
+FPS_WAIT_SECONDS = 1.0     # longest a live start waits to learn the camera's frame rate
 
 
 # ── Errors ──────────────────────────────────────────────────────────────────
@@ -519,7 +520,24 @@ class _RtpVideoDepacketizer:
         self._ps = {}
         self._just_sent_ps = False
         self._ts = None          # RTP timestamp of the current frame
+        self._frame_ts = []      # the first frames' RTP timestamps, for fps
         self._frame_flagged = False
+
+    @property
+    def fps(self):
+        """The camera's frame rate, from the RTP timestamps (a 90 kHz clock), or
+        None until a few frames have been seen. Raw H.264/H.265 carries no
+        timing, and ffmpeg assumes 25 fps: a camera that sends 12.5 would play
+        at double speed."""
+        t = self._frame_ts
+        if len(t) < 5:
+            return None
+        steps = sorted(d for d in ((b - a) & 0xFFFFFFFF for a, b in zip(t, t[1:]))
+                       if 0 < d < 90000)       # no repeats, wraps or pauses
+        if len(steps) < 3:
+            return None
+        fps = 90000 / steps[len(steps) // 2]
+        return round(fps, 2) if 1 <= fps <= 60 else None
 
     # NAL type of an Annex-B unit (start code included)
     def _type(self, nal):
@@ -562,6 +580,8 @@ class _RtpVideoDepacketizer:
         ts = bytes(pkt[4:8])
         if ts != self._ts:                       # new frame
             self._ts, self._frame_flagged = ts, False
+            if len(self._frame_ts) < 12:
+                self._frame_ts.append(int.from_bytes(ts, 'big'))
         if pkt[0] & 0x10:                        # RTP header extension → flagged frame
             self._frame_flagged = True
         nals = self._depay_hevc(p) if self.codec == 'hevc' else self._depay_h264(p)
@@ -829,10 +849,17 @@ class CloudLiveStream:
             # Prime: wait until we actually have decodable video, so callers
             # can pick the right ffmpeg demuxer and fall back if needed.
             deadline = time.monotonic() + probe_seconds
+            ready_at = None
             for chunk in self._packets:
                 if chunk:
                     self._pending.append(chunk)
-                    if self.input_format is not None and self._has_video:
+                if self.input_format is not None and self._has_video:
+                    # A live RTP stream also needs its frame rate (see ``fps``):
+                    # a few frames after the keyframe tell it, but never hold the
+                    # picture back for long.
+                    ready_at = ready_at or time.monotonic()
+                    if (self.playback or self._depay is None or self.fps
+                            or time.monotonic() - ready_at > FPS_WAIT_SECONDS):
                         return self
                 if time.monotonic() > deadline:
                     break
@@ -842,6 +869,11 @@ class CloudLiveStream:
                 e.serial, e.device_name = self.cam.device_serial, self.cam.device_name
             self.close()
             raise
+
+    @property
+    def fps(self):
+        """Frames per second of a live RTP stream, or None if not (yet) known."""
+        return self._depay.fps if self._depay is not None else None
 
     @property
     def _has_video(self):
