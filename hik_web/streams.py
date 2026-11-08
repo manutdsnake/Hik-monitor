@@ -93,7 +93,7 @@ class ClipJob:
 
 
 def _ffmpeg_cmd(fmt, outdir, *, live, speed=1.0, max_height=None, dar=None,
-                mode='hls', crf=24, maxrate=None, bufsize=None):
+                mode='hls', crf=24, maxrate=None, bufsize=None, threads=None):
     """ffmpeg: raw/PS cloud stream on stdin → H.264 for the browser.
 
     mode 'hls':  fMP4 HLS files in ``outdir`` (1 s segments).
@@ -109,6 +109,8 @@ def _ffmpeg_cmd(fmt, outdir, *, live, speed=1.0, max_height=None, dar=None,
         # Recordings arrive as MPEG-PS, faster than real time → pace them.
         cmd += ['-readrate', f'{speed:g}', '-f', fmt,
                 '-probesize', '500000', '-analyzeduration', '1000000']
+    if threads:
+        cmd += ['-threads', str(threads)]         # decoder: do not spawn a thread per host core
     cmd += ['-i', 'pipe:0', '-map', '0:v:0', '-an', '-sn']
     filters = []
     if dar:
@@ -127,6 +129,8 @@ def _ffmpeg_cmd(fmt, outdir, *, live, speed=1.0, max_height=None, dar=None,
             '-pix_fmt', 'yuv420p', '-profile:v', 'high',
             '-x264-params', 'ipratio=1.0:pbratio=1.0:qcomp=0.8',
             '-crf', str(crf)]
+    if threads:
+        cmd += ['-threads', str(threads)]
     if maxrate:
         cmd += ['-maxrate', maxrate, '-bufsize', bufsize or maxrate]
     cmd += ['-g', '25', '-keyint_min', '25', '-sc_threshold', '0',
@@ -270,11 +274,12 @@ class SessionManager:
         joins the running one instead of opening another relay stream."""
         k = (cam.key, quality, mode)
         with self._key_lock(k):
-            sid = self._live.get(k)
-            s = self._sessions.get(sid) if sid else None
-            if s is not None and s.running and not s.closed.is_set():
-                s.touch()
-                return s
+            with self._lock:
+                sid = self._live.get(k)
+                s = self._sessions.get(sid) if sid else None
+                if s is not None and s.running and not s.closed.is_set():
+                    s.touch()               # under the lock: the reaper cannot close it now
+                    return s
             if s is not None:
                 self.close(s)
             s = self._open('live', cloud, cam, code, quality=quality, dar=dar,
@@ -307,11 +312,16 @@ class SessionManager:
                               speed=speed, max_height=max_height, dar=dar, mode=mode,
                               crf=24 if small else 25,
                               maxrate='3000k' if small else '8000k',
-                              bufsize='6000k' if small else '16000k')
+                              bufsize='6000k' if small else '16000k',
+                              threads=1 if small else 2)
             with open(os.path.join(s.dir, 'ffmpeg.log'), 'wb') as logf:
                 s.proc = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, cwd=s.dir, stderr=logf,
                     stdout=subprocess.PIPE if mode == 'fmp4' else subprocess.DEVNULL)
+            try:
+                os.setpriority(os.PRIO_PROCESS, s.proc.pid, 5)    # yield to the web server and to neighbours
+            except OSError:
+                pass
             if mode == 'fmp4':
                 s.hub = Fmp4Hub()
                 threading.Thread(target=self._pump_fmp4, args=(s,), daemon=True,
@@ -387,23 +397,40 @@ class SessionManager:
         shutil.rmtree(s.dir, ignore_errors=True)
 
     def close(self, s):
+        self._unregister(s)
+        self._teardown(s)
+        log.info('closed %s session %s', s.kind, s.id)
+
+    def _unregister(self, s):
         with self._lock:
             self._sessions.pop(s.id, None)
             k = (s.cam.key, s.info.get('quality'), s.info.get('mode'))
             if self._live.get(k) == s.id:
                 self._live.pop(k, None)
+
+    def _reap_if_stale(self, s, now):
+        """Close an idle session. The check and the removal happen under one lock,
+        so a viewer that joins at that moment either keeps it alive or starts a
+        new one; it is never handed a session that is about to disappear."""
+        with self._lock:
+            idle = now - s.touched
+            stale = idle > s.idle_limit or (s.kind == 'live' and not s.running and idle > 5)
+            if not stale or self._sessions.get(s.id) is not s:
+                return
+            self._sessions.pop(s.id, None)
+            k = (s.cam.key, s.info.get('quality'), s.info.get('mode'))
+            if self._live.get(k) == s.id:
+                self._live.pop(k, None)
         self._teardown(s)
-        log.info('closed %s session %s', s.kind, s.id)
+        log.info('closed idle %s session %s', s.kind, s.id)
 
     def _reaper(self):
         while not self._stop.wait(3):
             now = time.monotonic()
             with self._lock:
-                stale = [s for s in self._sessions.values()
-                         if now - s.touched > s.idle_limit
-                         or (s.kind == 'live' and not s.running and now - s.touched > 5)]
-            for s in stale:
-                self.close(s)
+                candidates = list(self._sessions.values())
+            for s in candidates:
+                self._reap_if_stale(s, now)
             self._expire_clips(now)
 
     def _expire_clips(self, now):

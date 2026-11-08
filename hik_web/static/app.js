@@ -213,6 +213,7 @@ class Tile {
     this.hls = null;
     this.token = 0;
     this.state = 'idle';
+    this.retries = 0;
     const el = this.el = document.createElement('div');
     el.className = 'tile'; el.tabIndex = 0; el.dataset.key = cam.key; el.dataset.state = 'idle';
     el.innerHTML = `
@@ -288,7 +289,7 @@ class Tile {
 
   attach(r, token) {
     const v = this.video;
-    v.onplaying = () => { if (token === this.token) this.setState('playing'); };
+    v.onplaying = () => { if (token === this.token) { this.retries = 0; this.setState('playing'); } };
     if (r.ws) {
       this.mse = new MsePlayer(v, r.ws, e => { if (token === this.token) this.fail(e, token); });
     } else if (window.Hls && Hls.isSupported()) {
@@ -315,6 +316,14 @@ class Tile {
       return;
     }
     if (/6106/.test(e.message || '')) live.markEmpty(this.cam.key);
+    else if (this.retries < 3 && token === this.token) {
+      // A dropped connection (server restart, idle stream closed as we joined, a hiccup
+      // at the relay): try again a few times before showing an error.
+      this.retries++;
+      this.setState('connecting', 'Reconnecting…');
+      setTimeout(() => { if (token === this.token) this.start(this.quality); }, 700 * this.retries);
+      return;
+    }
     this.setState('error', friendly(e));
   }
 
