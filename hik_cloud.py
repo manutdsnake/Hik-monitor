@@ -127,7 +127,6 @@ class HikConnectCloud:
         self._feature_code = secrets.token_hex(16)
         self._service_urls = None
         self._resources = None
-        self._tokens, self._tokens_at = [], 0.0
         self._http = requests.Session()
         self._lock = threading.RLock()
 
@@ -188,7 +187,6 @@ class HikConnectCloud:
                 raise AuthError('Login succeeded but no sessionId was returned')
             self._service_urls = None
             self._resources = None
-            self._tokens = []
 
     def ensure_login(self):
         if not self.session_id:
@@ -297,17 +295,6 @@ class HikConnectCloud:
             raise AuthError('sessionId has no VTDU sign claim')
         return sign
 
-    def _next_token(self, max_age=45.0):
-        """One VTDU stream token. They come several per request, so a pool
-        saves a cloud call per camera when many are opened together."""
-        with self._lock:
-            if self._tokens and time.monotonic() - self._tokens_at < max_age:
-                return self._tokens.pop()
-        toks = self._vtdu_tokens(count=10)
-        with self._lock:
-            self._tokens, self._tokens_at = toks[1:], time.monotonic()
-        return toks[0]
-
     def _vtdu_tokens(self, count=5):
         self.ensure_login()
         last = None
@@ -395,7 +382,7 @@ class HikConnectCloud:
         port = vtm.get('port')
         if not host or not str(port or '').isdigit():
             raise StreamError('No VTM relay endpoint for this camera')
-        token = self._next_token()
+        token = self._vtdu_tokens()[0]
         url = build_vtm_url(str(host).strip(), int(port), cam.device_serial,
                             str(res.get('streamBizUrl') or ''), token,
                             channel=cam.channel_no, client_type=int(CLIENT_TYPE))
