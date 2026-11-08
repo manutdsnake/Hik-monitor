@@ -72,7 +72,12 @@ snapshots. Useful for an NVR at another location without a VPN or open ports.
   Use it with your own account and devices.
 - Only an MD5 hash of the password is stored (that is all the API ever receives).
 - If sign-in asks for a CAPTCHA, log in once in the official app, then retry.
-- Devices with video encryption enabled are not supported yet.
+- Devices with video encryption turned on (the "Stream Encryption" / verification
+  code setting) are supported: the first time you open one, the app asks for its
+  verification code — the one printed on the device label, or the one you set in
+  the Hik-Connect app. It is stored per device (in the same config file as your
+  login, readable only by you) and works for live view, playback and previews.
+  Tested with an H.265 NVR; H.264 devices use the same scheme but are untested.
 
 The cloud stream transport comes from [pyezvizapi](https://pypi.org/project/pyezvizapi/)
 (Apache-2.0); parts of the REST and RTP handling are adapted from
