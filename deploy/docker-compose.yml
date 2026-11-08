@@ -1,0 +1,40 @@
+# Run the web viewer in a container.
+#
+#   cp .env.example .env        # set the password, and HIK_WEB_BIND to a private address
+#   mkdir -p data && cp ~/.hikvision_monitor.json data/hikvision_monitor.json
+#   docker compose up -d --build
+#
+# The page shows live camera video, so keep it on a private network: bind it to a
+# Tailscale/VPN address (HIK_WEB_BIND) and always set a password. Do not expose it
+# to the internet.
+services:
+  hik-web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hik-web:local
+    container_name: hik-web
+    restart: always
+    user: "1000:1000"                 # must be able to write ./data
+    environment:
+      HIK_WEB_PASSWORD: ${HIK_WEB_PASSWORD:?set HIK_WEB_PASSWORD in .env}
+    ports:
+      - "${HIK_WEB_BIND:-127.0.0.1}:8765:8765"
+    volumes:
+      - ./data:/data                  # login, verification codes, small caches
+    tmpfs:
+      - /tmp:size=512m                # video segments live in memory, not on the disk
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 2                           # live video is transcoded: keep it from starving the host
+    mem_limit: 1g
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

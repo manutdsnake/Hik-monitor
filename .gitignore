@@ -27,3 +27,6 @@ testbuild-dir/
 *.flatpak
 repo/
 bundle-repo/
+
+# Web viewer deployment: holds the Hik-Connect login
+deploy/data/
